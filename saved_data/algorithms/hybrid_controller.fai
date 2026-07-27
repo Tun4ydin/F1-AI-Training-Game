@@ -1,0 +1,327 @@
+# Formula AI Hybrid Controller — Agile Waypoint v2
+# Predictive cornering plus controller-owned regeneration and deployment.
+# Hybrid combustion power is 70%; overtake deployment supplies the final 30%.
+
+# Trainable steering and stability parameters.
+waypoint_gain      = parameter(0.94, 0.35, 1.60)
+heading_gain       = parameter(0.64, 0.20, 1.20)
+center_gain        = parameter(0.42, 0.10, 0.90)
+ray_gain           = parameter(0.30, 0.05, 0.80)
+pass_gain          = parameter(1.85, 0.40, 2.50)
+awareness_range    = parameter(0.70, 0.30, 0.95)
+closing_trigger    = parameter(0.025, 0.00, 0.18)
+traffic_gain       = parameter(0.80, 0.10, 1.60)
+steering_smoothing = parameter(0.16, 0.00, 0.45)
+yaw_damping        = parameter(0.16, 0.00, 0.45)
+slide_correction   = parameter(0.34, 0.05, 0.80)
+understeer_comp    = parameter(0.08, 0.00, 0.22)
+oversteer_counter  = parameter(0.30, 0.05, 0.65)
+
+# Trainable pace, energy and strategy parameters.
+corner_caution = parameter(0.60, 0.25, 0.92)
+slip_caution   = parameter(0.44, 0.10, 0.82)
+throttle_gain  = parameter(2.05, 0.90, 3.20)
+brake_gain     = parameter(1.48, 0.60, 2.40)
+regen_gain     = parameter(0.72, 0.25, 1.10)
+deploy_level   = parameter(0.24, 0.08, 0.72)
+wear_caution   = parameter(0.28, 0.00, 0.60)
+pit_wear       = parameter(0.70, 0.40, 0.92)
+
+waypoint_command = (
+    (waypoint_5_right * 0.34)
+    + (waypoint_10_right * 0.62)
+    + (waypoint_20_right * 0.46)
+    + (waypoint_40_right * 0.20)
+) * waypoint_gain
+
+left_space = (
+    left + (far_left * 0.42)
+    + (ray_left_18 * 0.24) + (ray_left_90 * 0.10)
+)
+right_space = (
+    right + (far_right * 0.42)
+    + (ray_right_18 * 0.24) + (ray_right_90 * 0.10)
+)
+edge_balance = right_space - left_space
+classic_open_side = (
+    right + far_right * 0.40
+    - left - far_left * 0.40
+)
+
+# Racecraft is controller-owned during training. All three nearby-car vectors
+# contribute to the open-lane choice, including cars beside or behind us.
+traffic_bias = (
+    (
+        -opponent_1_right * 12.0 * opponent_1_present
+        * clamp(1.0 - abs(opponent_1_forward) * 3.0, 0.0, 1.0)
+    )
+    + (
+        -opponent_2_right * 12.0 * opponent_2_present
+        * clamp(1.0 - abs(opponent_2_forward) * 3.0, 0.0, 1.0)
+    )
+    + (
+        -opponent_3_right * 12.0 * opponent_3_present
+        * clamp(1.0 - abs(opponent_3_forward) * 3.0, 0.0, 1.0)
+    )
+) * traffic_gain
+lane_signal = edge_balance + traffic_bias
+learned_side = sign(lane_signal)
+if abs(lane_signal) < 0.03:
+    learned_side = 1.0
+learned_passing = 0.0
+clearing_pass = 0.0
+if (
+    car_ahead > 0.5
+    and car_ahead_distance < awareness_range
+    and (
+        closing_speed > closing_trigger
+        or car_ahead_distance < awareness_range * 0.75
+    )
+):
+    learned_passing = 1.0
+# Hold the chosen lane until the passed car is safely behind. Without this
+# clearance phase the controller can cut back across the rival's front wing.
+if (
+    opponent_1_present > 0.5
+    and opponent_1_forward <= 0.0
+    and opponent_1_forward > -0.16
+    and abs(opponent_1_right) > 0.015
+):
+    learned_passing = 1.0
+    clearing_pass = 1.0
+active_passing = max(passing, learned_passing)
+active_pass_side = passing_side
+if learned_passing > passing:
+    active_pass_side = learned_side
+if (
+    active_passing > 0.5
+    and opponent_1_present > 0.5
+    and abs(opponent_1_right) > 0.015
+):
+    active_pass_side = -sign(opponent_1_right)
+
+path_command = waypoint_command
+pass_command = 0.0
+if active_passing > 0.5:
+    path_command = waypoint_command * 0.20
+    pass_command = (
+        (active_pass_side * 0.82 - racing_line_offset) * pass_gain
+    )
+
+desired_steering = (
+    path_command
+    + (heading_error * heading_gain)
+    - (racing_line_offset * center_gain)
+    + (edge_balance * ray_gain)
+    + pass_command
+)
+desired_steering = (
+    desired_steering
+    - (angular_velocity * yaw_damping)
+    - (local_velocity_lateral * slide_correction)
+    + (
+        sign(desired_steering)
+        * (
+            understeer * understeer_comp
+            - oversteer * oversteer_counter
+        )
+    )
+)
+steering = clamp(
+    (previous_steering * steering_smoothing)
+    + (desired_steering * (1.0 - steering_smoothing)),
+    -1.0,
+    1.0
+)
+if active_passing > 0.5:
+    steering = clamp(
+        (
+            (active_pass_side * 0.82 - racing_line_offset) * pass_gain
+            + heading_error * 1.10
+        ),
+        -1.0,
+        1.0
+    )
+
+curve_demand = clamp(
+    (abs(waypoint_10_right) * 1.10)
+    + (abs(waypoint_20_right) * 0.88)
+    + (abs(waypoint_40_right) * 0.52),
+    0.0,
+    1.0
+)
+if active_passing > 0.5:
+    curve_demand = curve_demand * 0.25
+visibility = clamp(forward * 1.22, 0.24, 1.0)
+stint_pace = clamp(
+    1.0
+    - (tyre_wear * wear_caution)
+    - (fuel * 0.04)
+    - (rain * 0.24),
+    0.52,
+    1.0
+)
+target_speed = clamp(
+    (
+        1.03
+        - (curve_demand * corner_caution)
+        - (abs(steering) * 0.13)
+        - (tire_slip * slip_caution)
+    ) * visibility * stint_pace,
+    0.20,
+    1.0
+)
+speed_error = target_speed - speed
+traction_power = clamp(traction - (oversteer * 0.30), 0.20, 1.0)
+throttle = (
+    clamp(speed_error * throttle_gain, 0.0, 1.0)
+    * traction_power
+)
+brake = clamp((-speed_error - 0.025) * brake_gain, 0.0, 0.84)
+
+# Predictive regenerative braking begins before turn-in. It is disabled at low
+# speed so the Hybrid cannot stop at the first corner and remain there.
+regen_request = clamp(
+    (curve_demand - 0.30) * regen_gain
+    + max(0.0, -speed_error) * brake_gain,
+    0.0,
+    0.74
+)
+if speed > 0.34 and regen_request > brake:
+    brake = regen_request
+if brake > 0.02:
+    throttle = 0.0
+
+if gear < 0.26 and speed < 0.18:
+    brake = 0.0
+    throttle = max(throttle, 0.24)
+if rpm > 0.97:
+    throttle = min(throttle, 0.92)
+
+opponent_closing = clamp(-opponent_1_velocity_forward, 0.0, 1.0)
+if (
+    car_ahead > 0.5
+    and car_ahead_distance < 0.58
+    and abs(car_ahead_side) < 0.52
+):
+    throttle = min(
+        throttle,
+        clamp(car_ahead_distance / 0.58 - opponent_closing * 0.25, 0.0, 1.0)
+    )
+    brake = max(
+        brake,
+        clamp(
+            (0.58 - car_ahead_distance) * 1.85
+            + opponent_closing * 0.70,
+            0.0,
+            0.82
+        )
+    )
+
+# A committed pass uses a stable lane-change controller. Centreline-relative
+# waypoint vectors intentionally pause here because lateral offset is the goal.
+if active_passing > 0.5:
+    pass_steering = (
+        (classic_open_side * 1.00)
+        + (heading_error * 0.60)
+        + (
+            (active_pass_side * 0.82 - racing_line_offset)
+            * 1.80
+        )
+    )
+    pass_steering = (
+        pass_steering
+        + sign(pass_steering)
+        * (understeer - oversteer) * 0.28
+    )
+    steering = clamp(
+        pass_steering,
+        -1.0,
+        1.0
+    )
+    pass_target_speed = clamp(
+        (
+            forward * 1.10 - abs(steering) * 0.25
+        ) * stint_pace,
+        0.20,
+        1.0
+    )
+    pass_grip = clamp(
+        1.0
+        - dirty_tyres * 0.50
+        - understeer * 0.18
+        - oversteer * 0.35,
+        0.20,
+        1.0
+    )
+    throttle = clamp(
+        (pass_target_speed - speed) * 2.00,
+        0.0,
+        1.0
+    ) * pass_grip
+    brake = 0.0
+    if (
+        car_ahead > 0.5
+        and car_ahead_distance < 0.24
+        and abs(car_ahead_side) < 0.58
+    ):
+        throttle = min(throttle, car_ahead_distance / 0.24)
+        brake = clamp(
+            (0.24 - car_ahead_distance) * 3.20,
+            0.0,
+            0.88
+        )
+
+# Deploy on straights or to complete a pass. Keeping deployment out of loaded
+# corners protects traction and leaves battery for the next acceleration zone.
+overtake = 0.0
+if battery > deploy_level and (
+    (
+        curve_demand < 0.20
+        and forward > 0.72
+        and gear > 0.32
+        and traction > 0.82
+        and tire_slip < 0.16
+        and brake < 0.02
+    )
+    or (
+        active_passing > 0.5
+        and forward > 0.55
+        and traction > 0.70
+        and brake < 0.02
+    )
+):
+    overtake = 1.0
+
+if forward < 0.18:
+    brake = 0.0
+    throttle = max(throttle, 0.22)
+    steering = clamp(
+        (edge_balance * 1.10)
+        + (heading_error * 1.35)
+        - (racing_line_offset * 0.65),
+        -1.0,
+        1.0
+    )
+if off_track > 0.5:
+    brake = 0.0
+    throttle = min(max(throttle, 0.18), 0.34)
+    overtake = 0.0
+    steering = clamp(
+        (heading_error * 1.45) - (racing_line_offset * 0.85),
+        -1.0,
+        1.0
+    )
+if car_collision > 0.5 and active_passing > 0.5:
+    steering = clamp(
+        steering + active_pass_side * 0.22,
+        -1.0,
+        1.0
+    )
+
+pit_request = 0.0
+pit_tyre = 1.0
+if pit_available > 0.5 and (tyre_wear >= pit_wear or puncture > 0.5):
+    pit_request = 1.0
+if rain >= 0.45:
+    pit_tyre = 3.0
