@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+saved_data/brains/*.json
+saved_data/tracks/*.json
+saved_data/algorithms/*.json
+saved_data/replays/*.json
+!saved_data/brains/.gitkeep
+!saved_data/tracks/.gitkeep
+!saved_data/tracks/spa_francorchamps.json
+!saved_data/algorithms/.gitkeep
+!saved_data/replays/.gitkeep

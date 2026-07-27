@@ -1,0 +1,115 @@
+# Formula AI Controller
+# Sensors are normalized from 0.0 to 1.0.
+# parameter(default, minimum, maximum) values evolve between generations.
+
+# Trainable parameters
+steer_strength = parameter(1.00, 0.20, 1.80)
+recovery_gain  = parameter(0.60, 0.10, 1.50)
+far_weight     = parameter(0.40, 0.10, 1.00)
+power          = parameter(1.10, 0.30, 2.00)
+braking        = parameter(0.80, 0.05, 1.50)
+grip_penalty   = parameter(0.50, 0.10, 1.20)
+wear_caution   = parameter(0.35, 0.00, 0.70)
+pit_wear       = parameter(0.68, 0.35, 0.90)
+pass_strength  = parameter(1.80, 0.40, 2.40)
+handling_gain  = parameter(0.28, 0.00, 0.60)
+
+# Calculate spatial room on each side (combining close and far sensors)
+left_space  = left + (far_left * far_weight)
+right_space = right + (far_right * far_weight)
+
+# Positive means there is more room to the right. In pygame's screen
+# coordinates, positive steering also turns the car to the right.
+open_side = right_space - left_space
+
+# Keep the response proportional so small sensor differences produce small,
+# smooth corrections. heading_error already has the correct steering sign.
+pass_command = 0.0
+if passing > 0.5:
+    pass_command = (
+        (passing_side * 0.70 - racing_line_offset) * pass_strength
+    )
+raw_steering = (
+    (open_side * steer_strength)
+    + (heading_error * recovery_gain)
+    + pass_command
+)
+handling_balance = understeer - oversteer
+raw_steering = (
+    raw_steering
+    + sign(raw_steering) * handling_balance * handling_gain
+)
+steering = clamp(raw_steering, -1.0, 1.0)
+
+# Reduce aggression for tyre wear and fuel load. As fuel burns away, its
+# caution penalty gradually disappears and the car can recover pace.
+stint_aggression = clamp(1.0 - (tyre_wear * wear_caution) - (fuel * 0.06), 0.55, 1.00)
+
+# Throttle calculation based on vision, speed, cornering, fuel and tyre state.
+target_speed = (forward * power - (abs(steering) * 0.25)) * stint_aggression
+speed_error  = target_speed - speed
+
+# Reduce throttle power when tyres lose grip
+grip_factor = (
+    1.0
+    - (dirty_tyres * grip_penalty)
+    - (understeer * 0.18)
+    - (oversteer * 0.35)
+)
+
+# Calculate final throttle and clamp within valid range [0.0, 1.0]
+throttle_val = (speed_error * braking) * grip_factor
+throttle     = clamp(throttle_val, 0.0, 1.0)
+brake        = 0.0
+if is_hybrid > 0.5 and forward < 0.68 and speed > 0.38:
+    brake = clamp((0.68 - forward) * braking * 1.40, 0.0, 0.72)
+    throttle = 0.0
+
+if (
+    car_ahead > 0.5
+    and car_ahead_distance < 0.58
+    and abs(car_ahead_side) < 0.58
+):
+    throttle = min(throttle, car_ahead_distance / 0.58)
+    brake = max(
+        brake,
+        clamp((0.58 - car_ahead_distance) * 2.20, 0.0, 0.88)
+    )
+
+# Emergency avoidance for tight corners or wall proximity
+if is_hybrid < 0.5 and forward < 0.25:
+    throttle = 0.05
+    steering = clamp(sign(open_side) * 0.90, -1.0, 1.0)
+
+if is_hybrid > 0.5 and forward < 0.25 and speed <= 0.38:
+    throttle = 0.22
+    brake = 0.0
+    steering = clamp(
+        (open_side * 0.90) + (heading_error * 1.40),
+        -1.0,
+        1.0
+    )
+    if far_left + left + right + far_right < 0.12:
+        steering = 1.0
+if car_collision > 0.5 and passing > 0.5:
+    steering = clamp(steering + passing_side * 0.25, -1.0, 1.0)
+
+# Hybrid energy strategy. ICE cars ignore overtake. Hybrid cars deploy the
+# electrical 30% only on open track and regenerate in braking zones.
+overtake = 0.0
+if is_hybrid > 0.5 and battery > 0.18 and (
+    (forward > 0.72 and brake < 0.05)
+    or (passing > 0.5 and forward > 0.55)
+):
+    overtake = 1.0
+
+# Pit strategy is entirely user-controlled. tyre_wear is normalized, so 0.68
+# means 68%. A puncture forces a request in this starter strategy.
+pit_request = 0.0
+pit_tyre = 1.0
+if pit_available > 0.5 and (tyre_wear >= pit_wear or puncture > 0.5):
+    pit_request = 1.0
+
+# pit_tyre: 0 Soft, 1 Medium, 2 Hard, 3 Wet
+if rain >= 0.45:
+    pit_tyre = 3.0

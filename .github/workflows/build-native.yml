@@ -1,0 +1,24 @@
+name: Build native releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements-build.txt
+      - run: python build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Formula-AI-Lab-${{ matrix.os }}
+          path: dist/
