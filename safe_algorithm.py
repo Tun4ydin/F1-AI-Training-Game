@@ -94,9 +94,9 @@ class SafeAlgorithm:
             self.tree = ast.parse(source, mode="exec")
         except SyntaxError as exc:
             raise AlgorithmError(f"Line {exc.lineno}: {exc.msg}") from None
-        if sum(1 for _ in ast.walk(self.tree)) > 1600:
+        if sum(1 for _ in ast.walk(self.tree)) > 4000:
             raise AlgorithmError(
-                "Program is too large (maximum 1600 syntax nodes)"
+                "Program is too large (maximum 4000 syntax nodes)"
             )
         self.parameters = self._validate()
 

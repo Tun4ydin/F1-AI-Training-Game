@@ -20,6 +20,7 @@ FPS = 60
 # All world geometry is measured in metres.
 ROAD_W = 12.0
 KERB_W = 14.0
+KERB_COLOR_INTERVAL_M = 100.0
 BORDER_W = 30.0
 CAR_WIDTH_M = 2.0
 CAR_WHEELBASE_M = 3.4
@@ -32,9 +33,32 @@ MAX_ENGINE_RPM = 13000.0
 IDLE_ENGINE_RPM = 4000.0
 REFERENCE_TOP_SPEED = 1.67
 REFERENCE_SPEED_KPH = REFERENCE_TOP_SPEED * FPS * 3.6
+# A modern eight-speed sequential gearbox. Each gear's speed ceiling follows
+# from its ratio relative to eighth gear, so low gears are shorter and stronger.
+# Seventh is deliberately close to sixth so the car reaches eighth at roughly
+# 292 km/h instead of stalling below the former 314 km/h shift point.
+GEAR_RATIOS = (3.20, 2.55, 2.08, 1.72, 1.45, 1.25, 1.16, 0.94)
+GEAR_SPEED_LIMITS = tuple(
+    min(1.0, GEAR_RATIOS[-1] / ratio)
+    for ratio in GEAR_RATIOS
+)
+# Straight-line calibration targets:
+# combustion only: 0–100 ≈ 2.6 s and 0–200 ≈ 5.0 s;
+# deployment from third gear: 0–200 ≈ 4.6 s.
+BASE_ENGINE_ACCELERATION = 0.0066
+LOW_SPEED_TRACTION = 0.32
+FULL_TRACTION_SPEED = 0.60
+HYBRID_COMBUSTION_SHARE = 0.80
+HYBRID_ELECTRIC_SHARE = 0.20
+HYBRID_TOTAL_POWER_SCALE = 1.1875
+ROLLING_RESISTANCE = 0.00035
+AERO_DRAG_COEFFICIENT = 0.00076
 OPPONENT_SENSOR_RANGE_M = 60.0
 OVERTAKE_REWARD = 150.0
 OVERTAKE_COOLDOWN_FRAMES = FPS * 3
+# Boundary vision remains responsive at 20 Hz while the physics stays at
+# 60 Hz. Staggering the work is important when a full 20-car grid is active.
+RAYCAST_UPDATE_FRAMES = 3
 DEFAULT_CAMERA_ZOOM = 8.0
 MIN_CAMERA_ZOOM = 2.0
 MAX_CAMERA_ZOOM = 16.0
@@ -44,16 +68,26 @@ BRAIN_DIR = ROOT / "saved_data" / "brains"
 ALGORITHM_DIR = ROOT / "saved_data" / "algorithms"
 REPLAY_DIR = ROOT / "saved_data" / "replays"
 
-BG = (12, 25, 20)
+BG = (7, 15, 18)
 GRASS = (31, 92, 49)
 ROAD = (57, 61, 66)
 ROAD_EDGE = (225, 228, 220)
 RED = (213, 44, 54)
-WHITE = (245, 245, 238)
-YELLOW = (255, 203, 48)
-CYAN = (65, 211, 229)
-MUTED = (145, 158, 153)
-INK = (9, 14, 13)
+WHITE = (239, 247, 244)
+YELLOW = (255, 196, 77)
+CYAN = (67, 225, 190)
+MUTED = (132, 153, 148)
+INK = (4, 9, 12)
+UI_SURFACE = (13, 28, 27)
+UI_SURFACE_RAISED = (18, 39, 36)
+UI_SURFACE_HOVER = (25, 55, 49)
+UI_BORDER = (48, 78, 72)
+UI_BORDER_BRIGHT = (78, 122, 111)
+UI_SHADOW = (3, 8, 10)
+UI_BLUE = (83, 160, 255)
+UI_VIOLET = (166, 115, 255)
+UI_ORANGE = (255, 137, 79)
+UI_ACCENTS = (CYAN, UI_BLUE, UI_ORANGE, UI_VIOLET)
 COLORS = [
     (239, 65, 54), (56, 189, 248), (250, 204, 21), (34, 197, 94),
     (168, 85, 247), (249, 115, 22), (236, 72, 153), (20, 184, 166),
@@ -153,6 +187,7 @@ class Track:
             self.centerline_widths_m,
         ) = self._build_spline()
         self.pitlane_centerline = self._build_pitlane()
+        self._pit_box_positions_cache = None
         self._ribbon_cache = {}
         self.segment_lengths_m = [
             self.centerline[i].distance_to(self.centerline[(i + 1) % len(self.centerline)])
@@ -326,19 +361,24 @@ class Track:
 
     def pit_box_positions(self):
         """Resolve pit boxes on new pitlanes or legacy main-track saves."""
+        if self._pit_box_positions_cache is not None:
+            return self._pit_box_positions_cache
         boxes = self.features.get("pit_boxes", [])
         if self.pitlane_points:
-            return [
+            positions = [
                 self.pitlane_points[int(index)].copy()
                 for index in boxes
                 if 0 <= int(index) < len(self.pitlane_points)
             ]
-        # Compatibility for tracks saved before dedicated pit roads existed.
-        return [
-            self.points[int(index) % len(self.points)].copy()
-            for index in boxes
-            if self.points
-        ]
+        else:
+            # Compatibility for tracks saved before dedicated pit roads existed.
+            positions = [
+                self.points[int(index) % len(self.points)].copy()
+                for index in boxes
+                if self.points
+            ]
+        self._pit_box_positions_cache = tuple(positions)
+        return self._pit_box_positions_cache
 
     def nearest(self, point):
         best = (1e9, Vector2(), 0, 0)
@@ -453,6 +493,35 @@ class Track:
     def _screen_points(points, offset, scale):
         return [point * scale + offset for point in points]
 
+    def visible_segments(self, screen, offset, scale):
+        """Return track segments that can intersect the current clip area."""
+        if scale <= 0:
+            return tuple(range(len(self.centerline)))
+        clip = screen.get_clip()
+        world_left = (clip.left - offset.x) / scale
+        world_right = (clip.right - offset.x) / scale
+        world_top = (clip.top - offset.y) / scale
+        world_bottom = (clip.bottom - offset.y) / scale
+        minimum_x = math.floor(
+            min(world_left, world_right) / self.spatial_cell_m
+        ) - 1
+        maximum_x = math.floor(
+            max(world_left, world_right) / self.spatial_cell_m
+        ) + 1
+        minimum_y = math.floor(
+            min(world_top, world_bottom) / self.spatial_cell_m
+        ) - 1
+        maximum_y = math.floor(
+            max(world_top, world_bottom) / self.spatial_cell_m
+        ) + 1
+        visible = set()
+        for cell_x in range(minimum_x, maximum_x + 1):
+            for cell_y in range(minimum_y, maximum_y + 1):
+                visible.update(
+                    self.spatial_segments.get((cell_x, cell_y), ())
+                )
+        return tuple(sorted(visible))
+
     def surface(self, point):
         if self.is_in_pitlane(point):
             return "pitlane"
@@ -466,10 +535,19 @@ class Track:
             return "grass"
         return "wall"
 
+    def kerb_color_at_segment(self, index):
+        """Alternate red and white kerb bands every 100 world metres."""
+        distance_m = self.cumulative_lengths_m[
+            int(index) % len(self.centerline)
+        ]
+        band = int(distance_m // KERB_COLOR_INTERVAL_M)
+        return RED if band % 2 == 0 else WHITE
+
     def draw(self, screen, offset=Vector2(), scale=1.0):
         pts = self._screen_points(self.centerline, offset, scale)
         if len(pts) < 2:
             return
+        visible = self.visible_segments(screen, offset, scale)
 
         # Every visual layer is derived from the same mitered ribbon vertices.
         # This removes the triangular gaps produced by independent thick-line
@@ -481,7 +559,7 @@ class Track:
         border_left, border_right = self.ribbon_edges(border_widths)
         border_left_px = self._screen_points(border_left, offset, scale)
         border_right_px = self._screen_points(border_right, offset, scale)
-        for index in range(len(pts)):
+        for index in visible:
             following = (index + 1) % len(pts)
             pygame.draw.polygon(
                 screen, (17, 43, 28),
@@ -503,10 +581,10 @@ class Track:
         road_right_px = self._screen_points(road_right, offset, scale)
         kerb_left_px = self._screen_points(kerb_left, offset, scale)
         kerb_right_px = self._screen_points(kerb_right, offset, scale)
-        for i, enabled in enumerate(self.kerb_segments):
-            if enabled:
+        for i in visible:
+            if self.kerb_segments[i]:
                 following = (i + 1) % len(pts)
-                color = RED if (i // 3) % 2 == 0 else WHITE
+                color = self.kerb_color_at_segment(i)
                 pygame.draw.polygon(
                     screen, color,
                     (
@@ -526,7 +604,7 @@ class Track:
                     ),
                 )
 
-        for index in range(len(pts)):
+        for index in visible:
             following = (index + 1) % len(pts)
             pygame.draw.polygon(
                 screen, ROAD,
@@ -562,8 +640,20 @@ class Track:
                 screen, (160, 164, 164), False, pit_points
             )
         edge_color = (112, 116, 117)
-        pygame.draw.aalines(screen, edge_color, True, road_left_px)
-        pygame.draw.aalines(screen, edge_color, True, road_right_px)
+        if len(visible) < len(pts) * 0.65:
+            for index in visible:
+                following = (index + 1) % len(pts)
+                pygame.draw.aaline(
+                    screen, edge_color,
+                    road_left_px[index], road_left_px[following],
+                )
+                pygame.draw.aaline(
+                    screen, edge_color,
+                    road_right_px[index], road_right_px[following],
+                )
+        else:
+            pygame.draw.aalines(screen, edge_color, True, road_left_px)
+            pygame.draw.aalines(screen, edge_color, True, road_right_px)
         # One start/finish line; editor control points are not physical seams.
         if len(self.centerline) > 1:
             start_index = int(self.features.get("start_finish", 0)) % len(self.points)
@@ -622,7 +712,7 @@ class Track:
         for i, enabled in enumerate(self.kerb_segments):
             if enabled:
                 pygame.draw.line(
-                    screen, RED if (i // 3) % 2 == 0 else WHITE,
+                    screen, self.kerb_color_at_segment(i),
                     pts[i], pts[(i + 1) % len(pts)], 22,
                 )
         if not self.variable_width:
@@ -714,6 +804,11 @@ class Brain:
         "opponent_3_velocity_forward", "opponent_3_velocity_right",
         "opponent_1_present", "opponent_2_present", "opponent_3_present",
         "previous_steering", "previous_throttle", "previous_brake",
+        "corner_curvature_10", "corner_curvature_20",
+        "corner_curvature_40",
+        "race_position", "field_size", "position_deficit",
+        "gap_to_leader_m", "gap_to_next_m",
+        "race_aggression", "aggression_error",
     )
     DRIVING_INPUTS = 8
 
@@ -977,6 +1072,19 @@ class Car:
     previous_steering: float = 0.0
     previous_throttle: float = 0.0
     previous_brake: float = 0.0
+    race_position: int = 1
+    field_size: int = 1
+    position_deficit: float = 0.0
+    gap_to_leader_m: float = 0.0
+    gap_to_next_m: float = 0.0
+    race_aggression: float = 0.0
+    aggression_error: float = 0.0
+    aggression_mistake_frames: float = field(
+        default=0.0, repr=False, compare=False
+    )
+    aggression_mistake_cooldown: float = field(
+        default=0.0, repr=False, compare=False
+    )
     opponent_data: tuple = field(
         default_factory=lambda: (0.0,) * 12,
         repr=False,
@@ -987,6 +1095,14 @@ class Car:
         repr=False,
         compare=False,
     )
+    raycast_cache: tuple | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    sensor_frame: int = field(default=0, repr=False, compare=False)
+    sensor_phase: int = field(default=-1, repr=False, compare=False)
+    track_segment: int = field(default=0, repr=False, compare=False)
     overtake_candidates: set = field(
         default_factory=set,
         repr=False,
@@ -1010,12 +1126,19 @@ class Car:
         speed_ratio = clamp(
             forward_speed / REFERENCE_TOP_SPEED, 0.0, 1.0
         )
-        self.gear = min(
+        self.gear = next(
+            (
+                index
+                for index, limit in enumerate(GEAR_SPEED_LIMITS, start=1)
+                if speed_ratio <= limit
+            ),
             GEAR_COUNT,
-            max(1, int(speed_ratio * GEAR_COUNT) + 1),
         )
-        gear_low = (self.gear - 1) / GEAR_COUNT
-        gear_high = self.gear / GEAR_COUNT
+        gear_low = (
+            0.0 if self.gear == 1
+            else GEAR_SPEED_LIMITS[self.gear - 2]
+        )
+        gear_high = GEAR_SPEED_LIMITS[self.gear - 1]
         within_gear = clamp(
             (speed_ratio - gear_low) / max(gear_high - gear_low, 1e-9),
             0.0, 1.0,
@@ -1031,21 +1154,53 @@ class Car:
             )
         self.rpm = clamp(self.rpm, IDLE_ENGINE_RPM, MAX_ENGINE_RPM)
 
+    def drivetrain_power_factor(self):
+        """Return available wheel force for the current gear and engine RPM."""
+        ratio_strength = GEAR_RATIOS[self.gear - 1] / GEAR_RATIOS[0]
+        gear_force = 0.10 + ratio_strength * 0.90
+        rpm_fraction = clamp(
+            (self.rpm - IDLE_ENGINE_RPM)
+            / (MAX_ENGINE_RPM - IDLE_ENGINE_RPM),
+            0.0, 1.0,
+        )
+        # Power stays strong through the useful rev range, then falls
+        # progressively over the final third of the gear.
+        redline_zone = clamp((rpm_fraction - 0.67) / 0.33, 0.0, 1.0)
+        redline_falloff = 1.0 - 0.20 * redline_zone ** 2
+        return gear_force * redline_falloff
+
     def raycast_distances(self, track):
         """Return nine normalized boundary rays from left side to right side."""
         values = []
         for relative in (-90, -70, -35, -18, 0, 18, 35, 70, 90):
             direction = Vector2(1, 0).rotate(self.angle + relative)
-            distance = 0
-            for distance in range(2, 122, 2):
-                if track.surface(
-                    self.position + direction * distance
-                ) not in ("asphalt", "kerb", "pitlane"):
+            previous_distance = 0.0
+            distance = 4.0
+            while distance <= 120.0:
+                if track.surface(self.position + direction * distance) not in (
+                    "asphalt", "kerb", "pitlane",
+                ):
+                    # Refine the four-metre crossing so sensor precision stays
+                    # close to the old two-metre marching implementation.
+                    low, high = previous_distance, distance
+                    for _ in range(2):
+                        midpoint = (low + high) / 2
+                        if track.surface(
+                            self.position + direction * midpoint
+                        ) in ("asphalt", "kerb", "pitlane"):
+                            low = midpoint
+                        else:
+                            high = midpoint
+                    distance = low
                     break
+                previous_distance = distance
+                distance += 4.0
+            else:
+                distance = 120.0
             values.append(distance / 120)
         return values
 
-    def sensors(self, track, raycasts=None):
+    def sensors(self, track, raycasts=None, tangent=None):
         raycasts = raycasts or self.raycast_distances(track)
         # Preserve the original five inputs and their ordering for existing
         # user algorithms. Four additional rays are appended later.
@@ -1053,7 +1208,7 @@ class Car:
             raycasts[1], raycasts[2], raycasts[4],
             raycasts[6], raycasts[7],
         ]
-        tangent = track.tangent(self.position)
+        tangent = tangent or track.tangent(self.position)
         heading = Vector2(1, 0).rotate(self.angle)
         signed = math.atan2(heading.cross(tangent), heading.dot(tangent)) / math.pi
         # Keep the original 1.7 normalization divisor so legacy brains retain
@@ -1069,10 +1224,23 @@ class Car:
             "Hard": (0.0, 0.0, 1.0, 0.0),
             "Wet": (0.0, 0.0, 0.0, 1.0),
         }
-        progress_m = track.progress_metres(self.position)
+        _, nearest_line, line_segment, line_ratio = track.nearest(
+            self.position
+        )
+        self.track_segment = line_segment
+        progress_m = (
+            track.cumulative_lengths_m[line_segment]
+            + track.segment_lengths_m[line_segment] * line_ratio
+        )
         lap_progress = progress_m / max(track.measured_length_m, 1e-9)
-        _, nearest_line, line_segment, _ = track.nearest(self.position)
-        line_tangent = track.tangent(self.position)
+        line_delta = (
+            track.centerline[(line_segment + 1) % len(track.centerline)]
+            - track.centerline[line_segment]
+        )
+        line_tangent = (
+            line_delta.normalize()
+            if line_delta.length_squared() else Vector2(1, 0)
+        )
         line_normal = Vector2(-line_tangent.y, line_tangent.x)
         heading = Vector2(1, 0).rotate(self.angle)
         local_normal = Vector2(-heading.y, heading.x)
@@ -1088,18 +1256,48 @@ class Car:
             self.velocity.dot(local_normal) / REFERENCE_TOP_SPEED,
             -1.0, 1.0,
         )
-        raycasts = self.raycast_distances(track)
-        waypoint_values = []
-        for lookahead in (5.0, 10.0, 20.0, 40.0):
-            relative = (
-                track.point_at_distance(progress_m + lookahead)
-                - self.position
+        if self.sensor_phase < 0:
+            self.sensor_phase = sum(ord(character) for character in self.name) % (
+                RAYCAST_UPDATE_FRAMES
             )
+        if (
+            self.raycast_cache is None
+            or self.sensor_frame % RAYCAST_UPDATE_FRAMES == self.sensor_phase
+        ):
+            self.raycast_cache = tuple(self.raycast_distances(track))
+        self.sensor_frame += 1
+        raycasts = self.raycast_cache
+        waypoint_values = []
+        waypoint_points = []
+        for lookahead in (5.0, 10.0, 20.0, 40.0):
+            waypoint = track.point_at_distance(progress_m + lookahead)
+            waypoint_points.append(waypoint)
+            relative = waypoint - self.position
             waypoint_values.extend((
                 clamp(relative.dot(heading) / lookahead, -1.0, 1.0),
                 clamp(relative.dot(local_normal) / lookahead, -1.0, 1.0),
             ))
-        return self.sensors(track, raycasts) + [
+        # Signed centreline curvature, normalized so 1.0 represents roughly a
+        # 20-metre radius. Unlike lateral waypoint displacement, these values
+        # are independent of the car's chosen racing-line offset.
+        curvature_values = []
+        for waypoint, lookahead in zip(
+            waypoint_points[1:],
+            (10.0, 20.0, 40.0),
+        ):
+            chord = waypoint - nearest_line
+            if chord.length_squared() > 1e-9:
+                chord_direction = chord.normalize()
+                angle_change = math.atan2(
+                    line_tangent.cross(chord_direction),
+                    line_tangent.dot(chord_direction),
+                )
+                curvature_values.append(
+                    clamp(angle_change * 40.0 / lookahead, -1.0, 1.0)
+                )
+            else:
+                curvature_values.append(0.0)
+        return self.sensors(track, raycasts, line_tangent) + [
             clamp(self.tyre_wear / 100.0, 0.0, 1.0),
             float(self.tyre_laps),
             clamp(self.fuel / 110.0, 0.0, 1.0),
@@ -1155,6 +1353,14 @@ class Car:
             clamp(self.previous_steering, -1.0, 1.0),
             clamp(self.previous_throttle, 0.0, 1.0),
             clamp(self.previous_brake, 0.0, 1.0),
+            *curvature_values,
+            float(self.race_position),
+            float(self.field_size),
+            clamp(self.position_deficit, 0.0, 1.0),
+            max(0.0, self.gap_to_leader_m),
+            max(0.0, self.gap_to_next_m),
+            clamp(self.race_aggression, 0.0, 1.0),
+            clamp(self.aggression_error, -1.0, 1.0),
         ]
 
     def update(self, track, dt=1.0, rain=0.0, damage_enabled=True):
@@ -1183,6 +1389,36 @@ class Car:
                 self.pitstops += 1
                 self.pit_requested = False
             return
+        # Aggressive trailing drivers occasionally misjudge a line or braking
+        # point. Mistakes are short pulses rather than frame-by-frame noise,
+        # making them visible, consequential, and recoverable.
+        if self.race_aggression <= 0.0:
+            self.aggression_error = 0.0
+            self.aggression_mistake_frames = 0.0
+            self.aggression_mistake_cooldown = 0.0
+        elif self.aggression_mistake_frames > 0.0:
+            self.aggression_mistake_frames = max(
+                0.0, self.aggression_mistake_frames - dt
+            )
+            if self.aggression_mistake_frames <= 0.0:
+                self.aggression_mistake_cooldown = random.uniform(90.0, 240.0)
+        else:
+            self.aggression_error *= 0.84 ** dt
+            self.aggression_mistake_cooldown = max(
+                0.0, self.aggression_mistake_cooldown - dt
+            )
+            mistake_probability = (
+                self.race_aggression ** 2 * 0.0022 * dt
+            )
+            if (
+                self.aggression_mistake_cooldown <= 0.0
+                and random.random() < mistake_probability
+            ):
+                mistake_sign = 1.0 if random.random() < 0.62 else -1.0
+                self.aggression_error = (
+                    mistake_sign * random.uniform(0.45, 1.0)
+                )
+                self.aggression_mistake_frames = random.uniform(20.0, 55.0)
         controller_inputs = self.controller_inputs(track, rain)
         # Contact is latched by collision resolution after physics, then
         # consumed exactly once by the following controller evaluation.
@@ -1242,13 +1478,21 @@ class Car:
             and self.brake_input < 0.05
         )
         deployment = 1.0 if self.overtake_active else 0.0
-        # ICE always has full engine power. A Hybrid has 70% combustion power;
-        # its controller may deploy the remaining 30% from the battery.
-        power_ratio = 0.70 + 0.30 * deployment if is_hybrid else 1.0
+        # Hybrid output is an 80% combustion / 20% electric split. Scaling the
+        # complete power unit by 1.1875 makes the 80% combustion portion equal
+        # to the calibrated 95% wheel-power level, enough for 0–200 in 5.0 s.
+        power_ratio = (
+            HYBRID_TOTAL_POWER_SCALE
+            * (
+                HYBRID_COMBUSTION_SHARE
+                + HYBRID_ELECTRIC_SHARE * deployment
+            )
+            if is_hybrid else 1.0
+        )
         if is_hybrid:
             speed_factor = clamp(speed / 1.35, 0.0, 1.0)
             self.battery_regen = self.brake_input * speed_factor * 0.045 * dt
-            battery_drain = deployment * throttle * 0.12 * dt
+            battery_drain = deployment * throttle * 0.08 * dt
             self.battery = clamp(
                 self.battery + self.battery_regen - battery_drain,
                 0.0, 100.0,
@@ -1301,10 +1545,27 @@ class Car:
             * (1.0 - self.understeer * 0.18 + self.oversteer * 0.20)
             * dt
         )
+        self.update_drivetrain(throttle)
+        drivetrain_power = self.drivetrain_power_factor()
+        launch_traction = (
+            LOW_SPEED_TRACTION
+            + (1.0 - LOW_SPEED_TRACTION)
+            * clamp(speed / FULL_TRACTION_SPEED, 0.0, 1.0)
+        )
+        # Compounds and conditions affect the traction-limited launch, but do
+        # not multiply engine horsepower once the car is at speed.
+        tyre_traction_factor = clamp(
+            1.0 + (tyre_grip - 1.0) * 0.40, 0.30, 1.05
+        )
+        available_traction = clamp(
+            launch_traction * tyre_traction_factor, 0.10, 1.0
+        )
         self.velocity += (
-            forward * throttle * (1.0 - self.brake_input) * 0.035
+            forward * throttle * (1.0 - self.brake_input)
+            * BASE_ENGINE_ACCELERATION
+            * drivetrain_power
             * power_ratio * (1.0 + draft * 0.08)
-            * grip * tyre_grip * dt
+            * grip * available_traction * dt
         )
         forward_speed = max(0.0, self.velocity.dot(forward))
         braking_delta = min(
@@ -1312,6 +1573,21 @@ class Car:
             self.brake_input * 0.028 * grip * tyre_grip * dt,
         )
         self.velocity -= forward * braking_delta
+
+        # A closed or nearly closed throttle makes the driven wheels resist
+        # rotation. Lower gears provide stronger engine braking.
+        engine_brake_request = clamp(
+            (0.25 - throttle) / 0.25, 0.0, 1.0
+        )
+        ratio_strength = GEAR_RATIOS[self.gear - 1] / GEAR_RATIOS[0]
+        engine_braking_delta = min(
+            max(0.0, self.velocity.dot(forward)),
+            engine_brake_request
+            * (0.0012 + 0.0028 * ratio_strength)
+            * grip * dt,
+        )
+        self.velocity -= forward * engine_braking_delta
+
         lateral = self.velocity - forward * self.velocity.dot(forward)
         self.velocity -= lateral * clamp(
             grip * tyre_grip * 0.22
@@ -1319,7 +1595,33 @@ class Car:
             * (1.0 - self.oversteer * 0.62),
             0.025, 0.27,
         ) * dt
-        self.velocity *= 0.996 ** dt
+
+        # Hard steering scrubs speed through the tyres. The loss rises quickly
+        # with both steering angle and velocity, preventing flat-out cornering.
+        current_speed = self.velocity.length()
+        cornering_scrub = min(
+            current_speed,
+            abs(steer) ** 1.7
+            * current_speed ** 2
+            * 0.004
+            * (1.0 + self.understeer * 0.45 + self.oversteer * 0.65)
+            * dt,
+        )
+        if current_speed > 1e-9 and cornering_scrub > 0:
+            self.velocity.scale_to_length(current_speed - cornering_scrub)
+
+        # Rolling resistance plus quadratic aerodynamic drag means a small
+        # maintenance throttle is no longer enough to hold maximum speed.
+        current_speed = self.velocity.length()
+        coast_drag = min(
+            current_speed,
+            (
+                ROLLING_RESISTANCE
+                + current_speed ** 2 * AERO_DRAG_COEFFICIENT
+            ) * dt,
+        )
+        if current_speed > 1e-9 and coast_drag > 0:
+            self.velocity.scale_to_length(current_speed - coast_drag)
         if self.velocity.length() > max_speed:
             self.velocity.scale_to_length(max_speed)
         if "grass" in wheel_surfaces:
@@ -1339,7 +1641,7 @@ class Car:
             if damage_enabled:
                 self.health -= impact * 7.0
             self.velocity *= -0.2
-            _, near, _, _ = track.nearest(self.position)
+            _, near, near_segment, _ = track.nearest(self.position)
             direction = self.position - near
             if direction.length():
                 margin = float(track.features.get("border_margin", BORDER_W))
@@ -1350,7 +1652,7 @@ class Car:
                     CAR_LENGTH_M / 2, CAR_WIDTH_M / 2
                 )
                 safe_distance = max(
-                    track.width_at_segment(track.nearest(near)[2]) / 2 + .5,
+                    track.width_at_segment(near_segment) / 2 + .5,
                     margin / 2 - car_clearance - .5,
                 )
                 self.position = (
@@ -1385,6 +1687,7 @@ class Car:
         wear_rate = {"Soft": .0018, "Medium": .0012, "Hard": .0008, "Wet": .0025}.get(self.tyre, .0012)
         if self.tyre == "Wet" and rain < .2:
             wear_rate *= 3.6
+        wear_rate *= 1.0 + self.race_aggression * 0.12
         self.tyre_wear += speed * wear_rate * dt
         self.fuel = max(
             0,
@@ -1400,8 +1703,12 @@ class Car:
             if self.position.distance_to(box_position) < 6:
                 self.pit_timer = 120
                 self.velocity *= .25
-        progress = track.progress(self.position)
-        progress_m = track.progress_metres(self.position)
+        _, _, progress_segment, progress_ratio = track.nearest(self.position)
+        progress = progress_segment + progress_ratio
+        progress_m = (
+            track.cumulative_lengths_m[progress_segment]
+            + track.segment_lengths_m[progress_segment] * progress_ratio
+        )
         if self.previous_progress_m is None:
             self.previous_progress_m = progress_m
         progress_delta_m = (
@@ -1872,13 +2179,65 @@ class Button:
 
     def draw(self, screen, fonts, mouse):
         hover = self.rect.collidepoint(mouse)
-        shadow = self.rect.move(0, 5)
-        pygame.draw.rect(screen, (5, 12, 10), shadow, border_radius=14)
-        pygame.draw.rect(screen, (35, 65, 54) if hover else (23, 43, 36), self.rect, border_radius=14)
-        pygame.draw.rect(screen, CYAN if hover else (54, 80, 70), self.rect, 2, border_radius=14)
-        pygame.draw.circle(screen, CYAN if hover else (75, 101, 91), (self.rect.x + 34, self.rect.centery), 15)
-        screen.blit(fonts["h2"].render(self.title, True, WHITE), (self.rect.x + 62, self.rect.y + 19))
-        screen.blit(fonts["small"].render(self.subtitle, True, MUTED), (self.rect.x + 62, self.rect.y + 60))
+        try:
+            index = max(0, int(self.title.split()[0]) - 1)
+        except (ValueError, IndexError):
+            index = 0
+        accent = UI_ACCENTS[index % len(UI_ACCENTS)]
+        shadow = self.rect.move(0, 6)
+        pygame.draw.rect(screen, UI_SHADOW, shadow, border_radius=16)
+        pygame.draw.rect(
+            screen,
+            UI_SURFACE_HOVER if hover else UI_SURFACE_RAISED,
+            self.rect,
+            border_radius=16,
+        )
+        pygame.draw.rect(
+            screen,
+            accent if hover else UI_BORDER,
+            self.rect,
+            2 if hover else 1,
+            border_radius=16,
+        )
+        pygame.draw.rect(
+            screen, accent,
+            (self.rect.x, self.rect.y + 17, 4, self.rect.height - 34),
+            border_radius=2,
+        )
+        badge = pygame.Rect(self.rect.x + 20, self.rect.y + 20, 44, 44)
+        pygame.draw.rect(
+            screen,
+            tuple(min(255, channel + 8) for channel in UI_SURFACE_HOVER),
+            badge,
+            border_radius=12,
+        )
+        pygame.draw.rect(screen, accent, badge, 1, border_radius=12)
+        number = self.title.split()[0]
+        number_surface = fonts["mono"].render(number, True, accent)
+        screen.blit(
+            number_surface,
+            number_surface.get_rect(center=badge.center),
+        )
+        clean_title = self.title[len(number):].strip()
+        screen.blit(
+            fonts["h2"].render(clean_title, True, WHITE),
+            (self.rect.x + 82, self.rect.y + 17),
+        )
+        screen.blit(
+            fonts["small"].render(self.subtitle, True, MUTED),
+            (self.rect.x + 82, self.rect.y + 52),
+        )
+        arrow = pygame.Rect(self.rect.right - 48, self.rect.centery - 16, 32, 32)
+        pygame.draw.rect(
+            screen,
+            accent if hover else UI_SURFACE,
+            arrow,
+            border_radius=10,
+        )
+        arrow_text = fonts["body"].render(
+            "→", True, INK if hover else MUTED
+        )
+        screen.blit(arrow_text, arrow_text.get_rect(center=arrow.center))
         return hover
 
 
@@ -1895,17 +2254,34 @@ class Game:
             (DISPLAY_WIDTH, DISPLAY_HEIGHT), self.display_flags
         )
         self.screen = pygame.Surface((WIDTH, HEIGHT)).convert()
+        self._ui_background = None
+        self._present_surface = None
+        self._present_size = None
+        self._minimap_cache = {}
         self.viewport_scale = 1.0
         self.viewport_rect = pygame.Rect(0, 0, WIDTH, HEIGHT)
         self.update_viewport()
         self.clock = pygame.time.Clock()
+        self.show_fps = False
         self.fonts = {
-            "title": pygame.font.SysFont("arial", 44, bold=True),
-            "h2": pygame.font.SysFont("arial", 25, bold=True),
-            "body": pygame.font.SysFont("arial", 18),
-            "small": pygame.font.SysFont("arial", 14),
-            "tiny": pygame.font.SysFont("arial", 12),
-            "mono": pygame.font.SysFont("monospace", 16, bold=True),
+            "title": pygame.font.SysFont(
+                "Inter, SF Pro Display, Avenir Next, Arial", 44, bold=True
+            ),
+            "h2": pygame.font.SysFont(
+                "Inter, SF Pro Display, Avenir Next, Arial", 25, bold=True
+            ),
+            "body": pygame.font.SysFont(
+                "Inter, SF Pro Text, Avenir Next, Arial", 18
+            ),
+            "small": pygame.font.SysFont(
+                "Inter, SF Pro Text, Avenir Next, Arial", 14
+            ),
+            "tiny": pygame.font.SysFont(
+                "Inter, SF Pro Text, Avenir Next, Arial", 12
+            ),
+            "mono": pygame.font.SysFont(
+                "SF Mono, Menlo, Consolas, monospace", 16, bold=True
+            ),
         }
         spa_path = TRACK_DIR / "spa_francorchamps.json"
         self.track = Track.load(spa_path) if spa_path.exists() else Track()
@@ -1955,6 +2331,7 @@ class Game:
         self.algorithm_undo = []
         self.algorithm_redo = []
         self.algorithm_scroll_line = 0
+        self.algorithm_docs_scroll_line = 0
         self.algorithm_dragging = False
         self.algorithm_clipboard = ""
         self.algorithm_preferred_col = None
@@ -2053,20 +2430,179 @@ class Game:
         return translated
 
     def present(self):
-        """Smoothly upscale the logical frame into the display viewport."""
+        """Upscale the logical frame without allocating a new surface."""
         self.window.fill(INK)
-        scaled = pygame.transform.smoothscale(
-            self.screen, self.viewport_rect.size
+        viewport_size = self.viewport_rect.size
+        if self._present_size != viewport_size:
+            self._present_surface = pygame.Surface(viewport_size).convert()
+            self._present_size = viewport_size
+        pygame.transform.smoothscale(
+            self.screen,
+            viewport_size,
+            self._present_surface,
         )
-        self.window.blit(scaled, self.viewport_rect)
+        self.window.blit(self._present_surface, self.viewport_rect)
         pygame.display.flip()
 
     def text(self, value, pos, font="body", color=WHITE):
         self.screen.blit(self.fonts[font].render(str(value), True, color), pos)
 
+    def draw_app_background(self):
+        """Draw a cached gradient-and-grid background for menu-style screens."""
+        if self._ui_background is None:
+            background = pygame.Surface((WIDTH, HEIGHT)).convert()
+            top = (6, 14, 18)
+            bottom = (10, 24, 25)
+            for y in range(HEIGHT):
+                ratio = y / max(HEIGHT - 1, 1)
+                color = tuple(
+                    round(start + (end - start) * ratio)
+                    for start, end in zip(top, bottom)
+                )
+                pygame.draw.line(background, color, (0, y), (WIDTH, y))
+            for x in range(0, WIDTH, 64):
+                pygame.draw.line(
+                    background, (14, 34, 34), (x, 0), (x, HEIGHT)
+                )
+            for y in range(0, HEIGHT, 64):
+                pygame.draw.line(
+                    background, (14, 34, 34), (0, y), (WIDTH, y)
+                )
+            glow = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            pygame.draw.circle(glow, (*CYAN, 18), (1120, 40), 330)
+            pygame.draw.circle(glow, (*UI_BLUE, 12), (1050, 690), 280)
+            pygame.draw.circle(glow, (*UI_VIOLET, 9), (100, 660), 220)
+            background.blit(glow, (0, 0))
+            self._ui_background = background
+        self.screen.blit(self._ui_background, (0, 0))
+
+    def glass_card(
+        self, rect, accent=None, elevated=True, radius=14
+    ):
+        """Draw one modern reusable card and return its normalized rectangle."""
+        rect = pygame.Rect(rect)
+        if elevated:
+            pygame.draw.rect(
+                self.screen, UI_SHADOW, rect.move(0, 5),
+                border_radius=radius,
+            )
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, rect, border_radius=radius
+        )
+        pygame.draw.rect(
+            self.screen,
+            accent if accent is not None else UI_BORDER,
+            rect,
+            1,
+            border_radius=radius,
+        )
+        if accent is not None:
+            pygame.draw.rect(
+                self.screen,
+                accent,
+                (rect.x + 18, rect.y, max(34, rect.width // 7), 3),
+                border_radius=2,
+            )
+        return rect
+
+    def draw_fps_counter(self):
+        """Draw a compact optional performance counter."""
+        value = self.fonts["mono"].render(
+            f"FPS {self.clock.get_fps():5.1f}", True, CYAN
+        )
+        card = value.get_rect(topright=(CANVAS_W - 14, 14)).inflate(30, 12)
+        pygame.draw.rect(
+            self.screen, UI_SHADOW, card.move(0, 3), border_radius=9
+        )
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, card, border_radius=9
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER_BRIGHT, card, 1, border_radius=9
+        )
+        pygame.draw.circle(
+            self.screen, CYAN, (card.x + 11, card.centery), 3
+        )
+        self.screen.blit(
+            value,
+            value.get_rect(midleft=(card.x + 20, card.centery)),
+        )
+
     def camera_transform(self, focus):
         centre = Vector2(CANVAS_W / 2, HEIGHT / 2)
         return centre - Vector2(focus) * self.camera_zoom, self.camera_zoom
+
+    @staticmethod
+    def camera_zoom_control_rects():
+        card = pygame.Rect(CANVAS_W - 164, 54, 148, 38)
+        return (
+            card,
+            pygame.Rect(card.x + 5, card.y + 5, 28, 28),
+            pygame.Rect(card.right - 33, card.y + 5, 28, 28),
+        )
+
+    def adjust_camera_zoom(self, steps):
+        """Apply bounded multiplicative camera zoom steps."""
+        if not steps:
+            return
+        self.camera_zoom = clamp(
+            self.camera_zoom * (1.15 ** steps),
+            MIN_CAMERA_ZOOM,
+            MAX_CAMERA_ZOOM,
+        )
+
+    def handle_camera_zoom_event(self, event):
+        """Handle wheel and clickable camera controls in driving modes."""
+        _, minus_rect, plus_rect = self.camera_zoom_control_rects()
+        if event.type == pygame.MOUSEWHEEL:
+            mouse_x, _ = self.logical_mouse_position()
+            if mouse_x < CANVAS_W:
+                self.adjust_camera_zoom(event.y)
+                return True
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button in (4, 5) and event.pos[0] < CANVAS_W:
+                self.adjust_camera_zoom(1 if event.button == 4 else -1)
+                return True
+            if event.button == 1:
+                if minus_rect.collidepoint(event.pos):
+                    self.adjust_camera_zoom(-1)
+                    return True
+                if plus_rect.collidepoint(event.pos):
+                    self.adjust_camera_zoom(1)
+                    return True
+        return False
+
+    def draw_camera_zoom_control(self):
+        """Draw shared zoom controls over the driving canvas."""
+        card, minus_rect, plus_rect = self.camera_zoom_control_rects()
+        mouse = self.logical_mouse_position()
+        pygame.draw.rect(
+            self.screen, UI_SHADOW, card.move(0, 3), border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, card, border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER_BRIGHT, card, 1, border_radius=10
+        )
+        for rect, symbol in ((minus_rect, "−"), (plus_rect, "+")):
+            hovered = rect.collidepoint(mouse)
+            pygame.draw.rect(
+                self.screen,
+                CYAN if hovered else UI_SURFACE_HOVER,
+                rect,
+                border_radius=6,
+            )
+            label = self.fonts["body"].render(
+                symbol, True, INK if hovered else WHITE
+            )
+            self.screen.blit(label, label.get_rect(center=rect.center))
+        zoom_label = self.fonts["tiny"].render(
+            f"ZOOM {self.camera_zoom:04.1f}x", True, CYAN
+        )
+        self.screen.blit(
+            zoom_label, zoom_label.get_rect(center=card.center)
+        )
 
     @staticmethod
     def minimap_projection(points, rect):
@@ -2099,21 +2635,59 @@ class Game:
     def draw_minimap(self, cars, focused=None, rect=(16, 16, 220, 165)):
         """Draw the complete circuit and color-coded live car positions."""
         rect = pygame.Rect(rect)
+        cache_key = (id(self.track), rect.size, self.track.name)
+        cached = self._minimap_cache.get(cache_key)
+        if cached is None:
+            cached = self._build_minimap_background(rect)
+            # A track replacement invalidates every old projection.
+            self._minimap_cache = {cache_key: cached}
+        background, scale, offset, map_rect = cached
+        overlay = background.copy()
+
+        # Minimap markers have no collision or separation. Draw cars from back
+        # to front so the car farther ahead naturally covers cars behind it
+        # when their projected positions overlap.
+        visible_cars = [
+            car for car in cars
+            if car.alive or car.finish_time is not None
+        ]
+        for car in sorted(visible_cars, key=lambda item: item.score):
+            marker = Vector2(car.position) * scale + offset
+            marker.x = clamp(marker.x, map_rect.left, map_rect.right)
+            marker.y = clamp(marker.y, map_rect.top, map_rect.bottom)
+            pygame.draw.circle(overlay, INK, marker, 5)
+            pygame.draw.circle(overlay, car.color, marker, 3)
+        if focused in visible_cars:
+            focused_marker = Vector2(focused.position) * scale + offset
+            focused_marker.x = clamp(
+                focused_marker.x, map_rect.left, map_rect.right
+            )
+            focused_marker.y = clamp(
+                focused_marker.y, map_rect.top, map_rect.bottom
+            )
+            pygame.draw.circle(overlay, WHITE, focused_marker, 6, 1)
+        self.screen.blit(overlay, rect)
+
+    def _build_minimap_background(self, rect):
+        """Render static minimap geometry once for the active track."""
         overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
         pygame.draw.rect(
-            overlay, (6, 18, 14, 222), overlay.get_rect(),
-            border_radius=11,
+            overlay, (*UI_SURFACE, 238), overlay.get_rect(),
+            border_radius=13,
         )
         pygame.draw.rect(
-            overlay, (81, 108, 97, 225), overlay.get_rect(), 1,
-            border_radius=11,
+            overlay, (*UI_BORDER_BRIGHT, 235), overlay.get_rect(), 1,
+            border_radius=13,
         )
         title = self.fonts["tiny"].render(
             f"TRACK MAP  •  {self.track.name[:14].upper()}",
             True, CYAN,
         )
         overlay.blit(title, (10, 7))
-        map_rect = pygame.Rect(12, 28, rect.width - 24, rect.height - 39)
+        # Keep thick circuit strokes and car markers away from the card edge.
+        map_rect = pygame.Rect(
+            16, 32, rect.width - 32, rect.height - 47
+        )
         track_count = len(self.track.centerline)
         scale, offset, projected_points = self.minimap_projection(
             self.track.centerline + self.track.pitlane_centerline,
@@ -2123,13 +2697,13 @@ class Game:
         pit_points = projected_points[track_count:]
         if len(track_points) >= 2:
             pygame.draw.lines(
-                overlay, (10, 31, 23), True, track_points, 8
+                overlay, (5, 13, 15), True, track_points, 9
             )
             pygame.draw.lines(
-                overlay, (122, 131, 132), True, track_points, 3
+                overlay, (91, 105, 108), True, track_points, 4
             )
             pygame.draw.aalines(
-                overlay, (210, 216, 213), True, track_points
+                overlay, (196, 213, 208), True, track_points
             )
             start_index = (
                 int(self.track.features.get("start_finish", 0))
@@ -2144,29 +2718,7 @@ class Game:
             pygame.draw.lines(
                 overlay, (249, 115, 22), False, pit_points, 2
             )
-
-        # Cars at the same training spawn form a small cluster, allowing every
-        # agent color to remain visible without implying a different location.
-        marker_groups = {}
-        for car in cars:
-            if not car.alive and car.finish_time is None:
-                continue
-            marker = Vector2(car.position) * scale + offset
-            marker.x = clamp(marker.x, map_rect.left, map_rect.right)
-            marker.y = clamp(marker.y, map_rect.top, map_rect.bottom)
-            key = (round(marker.x / 4), round(marker.y / 4))
-            marker_groups.setdefault(key, []).append((car, marker))
-        for group in marker_groups.values():
-            group_size = len(group)
-            for index, (car, marker) in enumerate(group):
-                if group_size > 1:
-                    angle = index * 360.0 / group_size
-                    marker += Vector2(5.0, 0.0).rotate(angle)
-                pygame.draw.circle(overlay, INK, marker, 5)
-                pygame.draw.circle(overlay, car.color, marker, 3)
-                if car is focused:
-                    pygame.draw.circle(overlay, WHITE, marker, 6, 1)
-        self.screen.blit(overlay, rect)
+        return overlay, scale, offset, map_rect
 
     def fit_editor_camera(self):
         if not self.editor_points:
@@ -2189,20 +2741,53 @@ class Game:
 
     def panel(self, title, eyebrow):
         x = CANVAS_W
-        pygame.draw.rect(self.screen, (7, 15, 13), (x, 0, PANEL, HEIGHT))
-        pygame.draw.line(self.screen, (51, 77, 67), (x, 0), (x, HEIGHT), 1)
-        self.text(eyebrow.upper(), (x + 22, 23), "small", CYAN)
-        self.text(title, (x + 22, 48), "h2")
-        pygame.draw.line(self.screen, (40, 62, 54), (x + 22, 88), (WIDTH - 22, 88), 1)
+        pygame.draw.rect(
+            self.screen, (8, 18, 20), (x, 0, PANEL, HEIGHT)
+        )
+        pygame.draw.rect(self.screen, CYAN, (x, 0, PANEL, 3))
+        pygame.draw.line(
+            self.screen, UI_BORDER, (x, 0), (x, HEIGHT), 1
+        )
+        eyebrow_card = pygame.Rect(x + 20, 18, PANEL - 40, 23)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, eyebrow_card, border_radius=7
+        )
+        pygame.draw.circle(
+            self.screen, CYAN,
+            (eyebrow_card.x + 11, eyebrow_card.centery), 3,
+        )
+        self.text(eyebrow.upper(), (x + 39, 22), "tiny", CYAN)
+        self.text(title, (x + 20, 52), "h2")
+        pygame.draw.line(
+            self.screen, UI_BORDER,
+            (x + 20, 91), (WIDTH - 20, 91), 1,
+        )
 
     def pill(self, label, value, x, y, width=112, accent=CYAN):
-        pygame.draw.rect(self.screen, (16, 32, 27), (x, y, width, 54), border_radius=8)
+        rect = pygame.Rect(x, y, width, 54)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, rect, border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER, rect, 1, border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen, accent, (x, y + 10, 3, 34), border_radius=2
+        )
         self.text(label.upper(), (x + 11, y + 8), "small", MUTED)
         self.text(value, (x + 11, y + 27), "mono", accent)
 
     def footer_hint(self, items):
         x = CANVAS_W + 18
-        pygame.draw.rect(self.screen, (10, 22, 18), (CANVAS_W + 1, HEIGHT - 70, PANEL - 1, 70))
+        pygame.draw.rect(
+            self.screen, (8, 19, 21),
+            (CANVAS_W + 1, HEIGHT - 70, PANEL - 1, 70),
+        )
+        pygame.draw.line(
+            self.screen, UI_BORDER,
+            (CANVAS_W + 18, HEIGHT - 70),
+            (WIDTH - 18, HEIGHT - 70),
+        )
         for i, item in enumerate(items[:2]):
             self.text(item, (x, HEIGHT - 57 + i * 25), "small", MUTED)
 
@@ -2521,15 +3106,18 @@ class Game:
         if self.name_dialog_background:
             self.screen.blit(self.name_dialog_background, (0, 0))
         overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        overlay.fill((2, 8, 6, 205))
+        overlay.fill((2, 7, 10, 218))
         self.screen.blit(overlay, (0, 0))
         card = pygame.Rect(345, 220, 590, 300)
-        pygame.draw.rect(self.screen, (14, 30, 25), card, border_radius=16)
-        pygame.draw.rect(self.screen, CYAN, card, 2, border_radius=16)
+        self.glass_card(card, accent=CYAN, radius=18)
         self.text(dialog["title"].upper(), (390, 255), "small", CYAN)
         self.text("Name this component", (390, 280), "h2", WHITE)
-        pygame.draw.rect(self.screen, (7, 17, 14), field, border_radius=8)
-        pygame.draw.rect(self.screen, CYAN, field, 1, border_radius=8)
+        pygame.draw.rect(
+            self.screen, (7, 18, 21), field, border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER_BRIGHT, field, 1, border_radius=10
+        )
         selection = self.name_dialog_selection()
         if selection:
             highlight = pygame.Rect(
@@ -2546,8 +3134,10 @@ class Game:
                 self.screen, YELLOW,
                 (caret_x, field.y + 14), (caret_x, field.y + 43), 2,
             )
-        pygame.draw.rect(self.screen, (32, 52, 45), cancel, border_radius=8)
-        pygame.draw.rect(self.screen, CYAN, save, border_radius=8)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_HOVER, cancel, border_radius=10
+        )
+        pygame.draw.rect(self.screen, CYAN, save, border_radius=10)
         cancel_text = self.fonts["mono"].render("CANCEL", True, MUTED)
         save_label = "REPLACE" if dialog["replace"] else "SAVE"
         save_text = self.fonts["mono"].render(save_label, True, INK)
@@ -2672,6 +3262,7 @@ class Game:
         self.algorithm_undo.clear()
         self.algorithm_redo.clear()
         self.algorithm_scroll_line = 0
+        self.algorithm_docs_scroll_line = 0
         self.algorithm_error = ""
 
     def save_algorithm(self, name=None):
@@ -2932,6 +3523,8 @@ class Game:
                     "battery": round(car.battery, 2),
                     "overtake": car.overtake_active,
                     "brake": round(car.brake_input, 3),
+                    "aggression": round(car.race_aggression, 3),
+                    "aggression_error": round(car.aggression_error, 3),
                     "speed_kph": round(car.speed_kph, 1),
                     "gear": car.gear,
                     "rpm": round(car.rpm),
@@ -2958,11 +3551,19 @@ class Game:
         return path
 
     def menu(self, events):
-        self.screen.fill(BG)
-        pygame.draw.circle(self.screen, (16, 45, 35), (1120, 65), 270)
-        self.text("FORMULA AI LAB", (70, 55), "title")
-        self.text("BUILD  •  EVOLVE  •  RACE  •  TIME", (75, 112), "mono", CYAN)
-        self.text("Choose a workspace", (75, 153), "small", MUTED)
+        self.draw_app_background()
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED,
+            (70, 36, 168, 26), border_radius=8,
+        )
+        pygame.draw.circle(self.screen, CYAN, (84, 49), 4)
+        self.text("SIMULATION ONLINE", (96, 42), "tiny", CYAN)
+        self.text("FORMULA AI LAB", (70, 72), "title")
+        self.text(
+            "DESIGN  /  TRAIN  /  COMPETE",
+            (75, 125), "mono", MUTED,
+        )
+        self.text("SELECT A WORKSPACE", (75, 154), "tiny", CYAN)
         cards = [
             Button((70, 175, 535, 86), "1  Track Studio", "Draw and save a closed circuit"),
             Button((675, 175, 535, 86), "2  AI Training", "Ghost agents share one start point"),
@@ -2973,9 +3574,16 @@ class Game:
         for card in cards:
             card.draw(self.screen, self.fonts, mouse)
         preview = pygame.Rect(70, 395, 1140, 235)
-        pygame.draw.rect(self.screen, (17, 34, 28), preview, border_radius=16)
-        pygame.draw.rect(self.screen, (45, 70, 60), preview, 1, border_radius=16)
-        self.text("ACTIVE CIRCUIT", (preview.x + 24, preview.y + 20), "small", MUTED)
+        self.glass_card(preview, accent=YELLOW, radius=18)
+        pygame.draw.rect(
+            self.screen, (24, 39, 37),
+            (preview.x + 22, preview.y + 18, 136, 24),
+            border_radius=7,
+        )
+        self.text(
+            "ACTIVE CIRCUIT",
+            (preview.x + 34, preview.y + 23), "tiny", YELLOW,
+        )
         self.text(self.track.name, (preview.x + 24, preview.y + 44), "h2", YELLOW)
         minimum_width = min(self.track.road_widths_m)
         maximum_width = max(self.track.road_widths_m)
@@ -2992,9 +3600,17 @@ class Game:
             (preview.x + 24, preview.y + 82), "small", CYAN,
         )
         self.track.draw_preview(self.screen, (preview.x + 300, preview.y + 20, preview.width - 325, preview.height - 40))
-        pygame.draw.rect(self.screen, (8, 18, 14), (0, 655, WIDTH, 105))
+        pygame.draw.rect(
+            self.screen, (7, 17, 20), (0, 655, WIDTH, 105)
+        )
+        pygame.draw.line(
+            self.screen, UI_BORDER, (0, 655), (WIDTH, 655)
+        )
         self.text("LOCAL SAVE", (70, 682), "small", CYAN)
-        self.text("Tracks and trained brains stay inside this project.", (70, 708), "body", MUTED)
+        self.text(
+            "Tracks and trained brains stay inside this project.",
+            (70, 708), "body", MUTED,
+        )
         self.text("ESC quits  •  Number keys open workspaces", (832, 702), "small", MUTED)
         for event in events:
             target = None
@@ -3031,10 +3647,76 @@ class Game:
             elif target == 3:
                 self.mode = "hotlap_setup"
 
+    def language_reference_docs(self):
+        """Return the language reference for the selected powertrain."""
+        docs = [
+            ("SENSORS", CYAN),
+            ("far_left, left, forward, right, far_right", WHITE),
+            ("ray_left/right_90, ray_left/right_18", WHITE),
+            ("speed, local_velocity_forward/lateral", WHITE),
+            ("angular_velocity, traction, tire_slip", WHITE),
+            ("rpm, gear 0..1; rpm_value, gear_number", WHITE),
+            ("speed_kph; heading_error -1..1", WHITE),
+            ("racing_line_offset -1 left / +1 right", WHITE),
+            ("waypoint_5_forward/right", WHITE),
+            ("waypoint_10_forward/right", WHITE),
+            ("waypoint_20_forward/right", WHITE),
+            ("waypoint_40_forward/right", WHITE),
+            ("corner_curvature_10/20/40 (-1..1)", WHITE),
+            ("race_position, field_size, position_deficit", WHITE),
+            ("gap_to_leader/next_m, race_aggression", WHITE),
+            ("aggression_error: -1 cautious / +1 overcommit", WHITE),
+            ("opponent_1/2/3_present + opponent_N_*", WHITE),
+            ("  forward/right + velocity_forward/right", MUTED),
+            ("car_ahead/distance/side, closing_speed", WHITE),
+            ("passing/side race assist; under/oversteer", WHITE),
+            ("previous_steering/throttle/brake", WHITE),
+            ("off_track, car_collision, dirty_tyres", WHITE),
+            ("tyre_wear/age, fuel/fuel_kg, health", WHITE),
+            ("puncture, rain, slipstream, lap/progress", WHITE),
+        ]
+        if self.training_generation == "Hybrid":
+            docs.append(("battery/regen/overtake (80% + 20%)", YELLOW))
+        else:
+            docs.append(("ICE: constant 100% power", YELLOW))
+        docs.extend([
+            ("OUTPUTS", CYAN),
+            ("steering: -1 left / +1 right", WHITE),
+            ("throttle / brake: 0.0 .. 1.0", WHITE),
+        ])
+        if self.training_generation == "Hybrid":
+            docs.append(("overtake: 0 off / 1 deploy", WHITE))
+        docs.extend([
+            ("pit_request: 0 no / 1 yes", WHITE),
+            ("pit_tyre: 0 S / 1 M / 2 H / 3 W", WHITE),
+            ("PARAMETER / FUNCTIONS / EDITOR", CYAN),
+            ("parameter(default, min, max)", WHITE),
+            ("clamp min max abs sign sqrt", WHITE),
+            ("Cmd/Ctrl A C X V Z Y • F find • L line", WHITE),
+        ])
+        return docs
+
     def algorithm(self, events):
         """In-game editor for the restricted, trainable controller language."""
         editor_rect = pygame.Rect(55, 154, 820, 510)
         docs_rect = pygame.Rect(900, 154, 325, 510)
+        docs = self.language_reference_docs()
+        docs_content_rect = pygame.Rect(
+            docs_rect.x + 14, docs_rect.y + 47,
+            docs_rect.width - 34, docs_rect.height - 61,
+        )
+        docs_line_height = 15
+        docs_visible_lines = max(
+            1, docs_content_rect.height // docs_line_height
+        )
+        docs_max_scroll = max(0, len(docs) - docs_visible_lines)
+        docs_scroll_track = pygame.Rect(
+            docs_rect.right - 10, docs_content_rect.y,
+            4, docs_content_rect.height,
+        )
+        self.algorithm_docs_scroll_line = clamp(
+            self.algorithm_docs_scroll_line, 0, docs_max_scroll
+        )
         start_rect = pygame.Rect(930, 684, 295, 52)
         reload_rect = pygame.Rect(755, 684, 155, 52)
         brain_rect = pygame.Rect(55, 105, 445, 38)
@@ -3197,16 +3879,36 @@ class Game:
                     self.editor_move_vertical(-20, shift)
                 elif event.key == pygame.K_PAGEDOWN:
                     self.editor_move_vertical(20, shift)
-            elif (
-                event.type == pygame.MOUSEWHEEL
-                and editor_rect.collidepoint(self.logical_mouse_position())
-            ):
-                lines, _ = self.editor_line_data()
-                self.algorithm_scroll_line = clamp(
-                    self.algorithm_scroll_line - event.y * 3, 0, max(0, len(lines) - 22),
-                )
+            elif event.type == pygame.MOUSEWHEEL:
+                mouse_position = self.logical_mouse_position()
+                if docs_rect.collidepoint(mouse_position):
+                    self.algorithm_docs_scroll_line = clamp(
+                        self.algorithm_docs_scroll_line - event.y * 3,
+                        0, docs_max_scroll,
+                    )
+                elif editor_rect.collidepoint(mouse_position):
+                    lines, _ = self.editor_line_data()
+                    self.algorithm_scroll_line = clamp(
+                        self.algorithm_scroll_line - event.y * 3,
+                        0, max(0, len(lines) - 22),
+                    )
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if start_rect.collidepoint(event.pos):
+                if (
+                    docs_max_scroll
+                    and docs_scroll_track.inflate(14, 0).collidepoint(
+                        event.pos
+                    )
+                ):
+                    scroll_fraction = clamp(
+                        (
+                            event.pos[1] - docs_scroll_track.top
+                        ) / max(docs_scroll_track.height, 1),
+                        0.0, 1.0,
+                    )
+                    self.algorithm_docs_scroll_line = round(
+                        scroll_fraction * docs_max_scroll
+                    )
+                elif start_rect.collidepoint(event.pos):
                     self.start_user_training()
                 elif brain_rect.collidepoint(event.pos):
                     self.cycle_training_brain(
@@ -3256,17 +3958,22 @@ class Game:
         elif current_line >= self.algorithm_scroll_line + 22:
             self.algorithm_scroll_line = current_line - 21
 
-        self.screen.fill(BG)
+        self.draw_app_background()
         self.text("CODED CONTROLLER", (55, 28), "small", CYAN)
         self.text("Write the driving algorithm", (55, 52), "title")
-        pygame.draw.rect(self.screen, (20, 43, 35), brain_rect, border_radius=7)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, brain_rect, border_radius=9
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER, brain_rect, 1, border_radius=9
+        )
         self.text("BASE BRAIN", (brain_rect.x + 12, brain_rect.y + 11), "small", MUTED)
         self.text(
             f"‹  {self.training_brain_label()[:27]}  ›",
             (brain_rect.x + 116, brain_rect.y + 10), "small", CYAN,
         )
         pygame.draw.rect(
-            self.screen, (20, 43, 35), racecraft_rect, border_radius=7
+            self.screen, UI_SURFACE_RAISED, racecraft_rect, border_radius=9
         )
         self.text(
             "RACECRAFT", (racecraft_rect.x + 10, racecraft_rect.y + 11),
@@ -3277,21 +3984,32 @@ class Game:
             (racecraft_rect.x + 112, racecraft_rect.y + 10),
             "small", CYAN if self.training_racecraft else MUTED,
         )
-        pygame.draw.rect(self.screen, (20, 43, 35), era_rect, border_radius=7)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, era_rect, border_radius=9
+        )
         self.text("POWER", (era_rect.x + 12, era_rect.y + 11), "small", MUTED)
         self.text(
             self.training_generation.upper(),
             (era_rect.x + 78, era_rect.y + 10), "small", YELLOW,
         )
-        pygame.draw.rect(self.screen, (20, 43, 35), track_rect, border_radius=7)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, track_rect, border_radius=9
+        )
         self.text("TRACK", (track_rect.x + 12, track_rect.y + 11), "small", MUTED)
         self.text(
             f"‹  {self.track_label()[:21]}  ›",
             (track_rect.x + 72, track_rect.y + 10), "small", CYAN,
         )
-        pygame.draw.rect(self.screen, (6, 14, 12), editor_rect.move(0, 4), border_radius=12)
-        pygame.draw.rect(self.screen, (12, 27, 22), editor_rect, border_radius=12)
-        pygame.draw.rect(self.screen, (47, 72, 63), editor_rect, 1, border_radius=12)
+        pygame.draw.rect(
+            self.screen, UI_SHADOW, editor_rect.move(0, 5),
+            border_radius=14,
+        )
+        pygame.draw.rect(
+            self.screen, (9, 22, 23), editor_rect, border_radius=14
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER, editor_rect, 1, border_radius=14
+        )
 
         lines_keep, line_starts = self.editor_line_data()
         first_line = self.algorithm_scroll_line
@@ -3333,59 +4051,55 @@ class Game:
             pygame.draw.rect(self.screen, (28, 50, 43), (editor_rect.right - 8, track_y, 3, track_h), border_radius=2)
             pygame.draw.rect(self.screen, CYAN, (editor_rect.right - 9, thumb_y, 5, thumb_h), border_radius=3)
 
-        pygame.draw.rect(self.screen, (15, 31, 26), docs_rect, border_radius=12)
-        pygame.draw.rect(self.screen, (45, 70, 60), docs_rect, 1, border_radius=12)
+        self.glass_card(docs_rect, accent=UI_BLUE, radius=14)
         self.text(
             f"{self.training_generation.upper()} LANGUAGE REFERENCE",
             (docs_rect.x + 20, docs_rect.y + 18), "small", YELLOW,
         )
-        docs = [
-            ("SENSORS", CYAN),
-            ("far_left, left, forward, right, far_right", WHITE),
-            ("ray_left/right_90, ray_left/right_18", WHITE),
-            ("speed, local_velocity_forward/lateral", WHITE),
-            ("angular_velocity, traction, tire_slip", WHITE),
-            ("rpm, gear 0..1; rpm_value, gear_number", WHITE),
-            ("speed_kph; heading_error -1..1", WHITE),
-            ("racing_line_offset -1 left / +1 right", WHITE),
-            ("waypoint_5_forward/right", WHITE),
-            ("waypoint_10_forward/right", WHITE),
-            ("waypoint_20_forward/right", WHITE),
-            ("waypoint_40_forward/right", WHITE),
-            ("opponent_1/2/3_present + opponent_N_*", WHITE),
-            ("  forward/right + velocity_forward/right", MUTED),
-            ("car_ahead/distance/side, closing_speed", WHITE),
-            ("passing/side race assist; under/oversteer", WHITE),
-            ("previous_steering/throttle/brake", WHITE),
-            ("off_track, car_collision, dirty_tyres", WHITE),
-            ("tyre_wear/age, fuel/fuel_kg, health", WHITE),
-            ("puncture, rain, slipstream, lap/progress", WHITE),
-        ]
-        if self.training_generation == "Hybrid":
-            docs.extend([
-                ("battery/regen/overtake (70% + 30%)", YELLOW),
-            ])
-        else:
-            docs.append(("ICE: constant 100% power", YELLOW))
-        docs.extend([
-            ("OUTPUTS", CYAN),
-            ("steering: -1 left / +1 right", WHITE),
-            ("throttle / brake: 0.0 .. 1.0", WHITE),
-        ])
-        if self.training_generation == "Hybrid":
-            docs.append(("overtake: 0 off / 1 deploy", WHITE))
-        docs.extend([
-            ("pit_request: 0 no / 1 yes", WHITE),
-            ("pit_tyre: 0 S / 1 M / 2 H / 3 W", WHITE),
-            ("PARAMETER / FUNCTIONS / EDITOR", CYAN),
-            ("parameter(default, min, max)", WHITE),
-            ("clamp min max abs sign sqrt", WHITE),
-            ("Cmd/Ctrl A C X V Z Y • F find • L line", WHITE),
-        ])
-        for i, (line, color) in enumerate(docs):
+        if docs_max_scroll:
             self.text(
-                line, (docs_rect.x + 20, docs_rect.y + 47 + i * 15),
+                "SCROLL",
+                (docs_rect.right - 58, docs_rect.y + 20), "tiny", MUTED,
+            )
+        first_doc = self.algorithm_docs_scroll_line
+        visible_docs = docs[
+            first_doc:first_doc + docs_visible_lines
+        ]
+        self.screen.set_clip(docs_content_rect)
+        for i, (line, color) in enumerate(visible_docs):
+            self.text(
+                line,
+                (
+                    docs_content_rect.x + 6,
+                    docs_content_rect.y + i * docs_line_height,
+                ),
                 "tiny", color,
+            )
+        self.screen.set_clip(None)
+        if docs_max_scroll:
+            pygame.draw.rect(
+                self.screen, UI_SURFACE_HOVER, docs_scroll_track,
+                border_radius=2,
+            )
+            docs_thumb_height = max(
+                34,
+                round(
+                    docs_scroll_track.height
+                    * docs_visible_lines / len(docs)
+                ),
+            )
+            docs_thumb_y = docs_scroll_track.y + round(
+                (
+                    docs_scroll_track.height - docs_thumb_height
+                ) * first_doc / docs_max_scroll
+            )
+            pygame.draw.rect(
+                self.screen, UI_BLUE,
+                (
+                    docs_scroll_track.x - 1, docs_thumb_y,
+                    6, docs_thumb_height,
+                ),
+                border_radius=3,
             )
         if self.algorithm_error:
             pygame.draw.rect(self.screen, (72, 25, 28), (55, 681, 680, 55), border_radius=8)
@@ -3881,6 +4595,12 @@ class Game:
                 car.opponent_data = (0.0,) * 12
                 car.opponent_presence = (0.0,) * 3
                 car.passing_target = None
+                car.race_position = 1
+                car.field_size = 1
+                car.position_deficit = 0.0
+                car.gap_to_leader_m = 0.0
+                car.gap_to_next_m = 0.0
+                car.race_aggression = 0.0
         for car in self.cars:
             car.update(
                 self.track, dt=dt, rain=self.rain_level,
@@ -3913,8 +4633,9 @@ class Game:
 
             heading = Vector2(1, 0).rotate(follower.angle)
             normal = Vector2(-heading.y, heading.x)
-            _, _, segment, _ = self.track.nearest(follower.position)
-            maximum_lateral = self.track.width_at_segment(segment) * 0.72
+            maximum_lateral = (
+                self.track.width_at_segment(follower.track_segment) * 0.72
+            )
             for opponent in self.cars:
                 if (
                     opponent is follower
@@ -3979,6 +4700,8 @@ class Game:
         save_algorithm_rect = pygame.Rect(CANVAS_W + 18, 632, 114, 36)
         save_brain_rect = pygame.Rect(CANVAS_W + 142, 632, 116, 36)
         for event in events:
+            if self.handle_camera_zoom_event(event):
+                continue
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.mode = "menu"
@@ -4011,13 +4734,9 @@ class Game:
                     max(self.cars, key=lambda c: c.fitness).puncture = True
                     self.notice("Training event: leader puncture")
                 elif event.key == pygame.K_LEFTBRACKET:
-                    self.camera_zoom = max(
-                        MIN_CAMERA_ZOOM, self.camera_zoom / 1.2
-                    )
+                    self.adjust_camera_zoom(-1)
                 elif event.key == pygame.K_RIGHTBRACKET:
-                    self.camera_zoom = min(
-                        MAX_CAMERA_ZOOM, self.camera_zoom * 1.2
-                    )
+                    self.adjust_camera_zoom(1)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if minus_rect.collidepoint(event.pos):
                     self.change_population(-1)
@@ -4053,6 +4772,7 @@ class Game:
             car.draw(self.screen, car is champion, camera_offset, camera_scale)
         self.screen.set_clip(None)
         self.draw_minimap(self.cars, champion)
+        self.draw_camera_zoom_control()
         training_mode = (
             "contact/draft • grid"
             if self.training_racecraft
@@ -4118,35 +4838,85 @@ class Game:
                     (control_x, 290, max(2, round(106 * value / 100)), 7),
                     border_radius=4,
                 )
+
+        # Full-width steering demographic. Zero remains fixed at the centre;
+        # the live steering command grows left or right from that marker.
+        steering_value = clamp(champion.steering_input, -1.0, 1.0)
+        steering_percent = int(round(steering_value * 100))
+        steering_card = pygame.Rect(x, 310, 240, 39)
+        steering_bar = pygame.Rect(x + 8, 333, 224, 8)
+        steering_centre = steering_bar.centerx
+        steering_width = round(
+            steering_bar.width / 2 * abs(steering_value)
+        )
+        pygame.draw.rect(
+            self.screen, (14, 28, 23), steering_card, border_radius=7
+        )
+        self.text("L", (x + 8, 314), "tiny", MUTED)
+        self.text("R", (x + 224, 314), "tiny", MUTED)
+        steering_label = self.fonts["tiny"].render(
+            f"STEERING {steering_percent:+4d}%",
+            True,
+            CYAN if steering_value else MUTED,
+        )
+        self.screen.blit(
+            steering_label,
+            steering_label.get_rect(center=(x + 120, 320)),
+        )
+        pygame.draw.rect(
+            self.screen, (38, 52, 47), steering_bar, border_radius=4
+        )
+        if steering_width:
+            steering_fill = pygame.Rect(
+                (
+                    steering_centre - steering_width
+                    if steering_value < 0 else steering_centre
+                ),
+                steering_bar.y,
+                steering_width,
+                steering_bar.height,
+            )
+            pygame.draw.rect(
+                self.screen,
+                (249, 115, 22) if steering_value < 0 else CYAN,
+                steering_fill,
+                border_radius=4,
+            )
+        pygame.draw.line(
+            self.screen, WHITE,
+            (steering_centre, steering_bar.y - 2),
+            (steering_centre, steering_bar.bottom + 2),
+            2,
+        )
         self.text(
             "RK / DRIVER      OVT  FITNESS  KM/H G",
-            (x, 312), "tiny", MUTED,
+            (x, 355), "tiny", MUTED,
         )
         for i, car in enumerate(ranked[:10]):
-            y = 329 + i * 27
+            y = 370 + i * 24
             selected = car is champion
             pygame.draw.rect(
                 self.screen,
                 (22, 43, 35) if selected else (12, 25, 21),
-                (x, y, 240, 23), border_radius=6,
+                (x, y, 240, 21), border_radius=6,
             )
             pygame.draw.rect(
                 self.screen, car.color,
-                (x + 7, y + 5, 4, 13), border_radius=2,
+                (x + 7, y + 4, 4, 13), border_radius=2,
             )
-            self.text(f"{i+1:>2}", (x + 17, y + 3), "small", MUTED)
-            self.text(car.name[:8], (x + 39, y + 3), "small", WHITE)
+            self.text(f"{i+1:>2}", (x + 17, y + 2), "small", MUTED)
+            self.text(car.name[:8], (x + 39, y + 2), "small", WHITE)
             self.text(
-                f"{car.overtakes:>2}", (x + 103, y + 3), "small",
+                f"{car.overtakes:>2}", (x + 103, y + 2), "small",
                 YELLOW if car.overtakes else MUTED,
             )
             self.text(
-                f"{car.fitness:5.0f}", (x + 126, y + 3), "small",
+                f"{car.fitness:5.0f}", (x + 126, y + 2), "small",
                 CYAN if selected else MUTED,
             )
             self.text(
                 f"{car.speed_kph:3.0f} G{car.gear}",
-                (x + 181, y + 3), "small",
+                (x + 181, y + 2), "small",
                 YELLOW if selected else MUTED,
             )
         for rect, label, color in (
@@ -4163,7 +4933,7 @@ class Game:
             f"● {state}", (x, 673), "small",
             YELLOW if self.paused else (84, 220, 140),
         )
-        self.footer_hint(("[−/+] Agents  •  [ / ] Camera", "[A] Code  •  [S] Brain"))
+        self.footer_hint(("[−/+] Agents  •  Wheel/[ ] Zoom", "[A] Code  •  [S] Brain"))
 
     def resolve_collisions(self, apply_damage=True):
         collisions = 0
@@ -4340,8 +5110,62 @@ class Game:
                 [1.0] * present_count + [0.0] * (3 - present_count)
             )
 
+    def update_race_aggression(self):
+        """Increase risk-taking as a car falls down the order or loses touch."""
+        active = [
+            car for car in self.cars
+            if car.alive and car.finish_time is None
+        ]
+        ranked = sorted(active, key=lambda car: car.score, reverse=True)
+        field_size = max(1, len(ranked))
+        if not ranked:
+            return
+        leader_score = ranked[0].score
+        lap_length = max(self.track.measured_length_m, 1.0)
+        target_laps = max(float(getattr(self, "target_laps", 1)), 1.0)
+        for index, car in enumerate(ranked):
+            previous = ranked[index - 1] if index else car
+            gap_to_leader = max(0.0, leader_score - car.score)
+            gap_to_next = (
+                max(0.0, previous.score - car.score)
+                if index else 0.0
+            )
+            position_deficit = (
+                index / (field_size - 1)
+                if field_size > 1 else 0.0
+            )
+            leader_gap_pressure = clamp(
+                gap_to_leader / (lap_length * 0.18),
+                0.0, 1.0,
+            )
+            next_gap_pressure = clamp(
+                gap_to_next / (lap_length * 0.045),
+                0.0, 1.0,
+            )
+            close_opportunity = (
+                clamp(1.0 - gap_to_next / 65.0, 0.0, 1.0)
+                * position_deficit
+            )
+            race_progress = clamp(
+                car.lap / target_laps, 0.0, 1.0
+            )
+            car.race_position = index + 1
+            car.field_size = field_size
+            car.position_deficit = position_deficit
+            car.gap_to_leader_m = gap_to_leader
+            car.gap_to_next_m = gap_to_next
+            car.race_aggression = clamp(
+                (position_deficit * 0.48)
+                + (leader_gap_pressure * 0.22)
+                + (next_gap_pressure * 0.15)
+                + (close_opportunity * 0.10)
+                + (race_progress * position_deficit * 0.05),
+                0.0, 1.0,
+            )
+
     def update_race_awareness(self, assist_passing=True):
         """Publish traffic data; optionally provide the legacy passing assist."""
+        self.update_race_aggression()
         self.update_opponent_vectors()
         maximum_distance = CAR_LENGTH_M * 5.0
         passing_trigger = CAR_LENGTH_M * 4.0
@@ -4363,8 +5187,9 @@ class Game:
 
             heading = Vector2(1, 0).rotate(follower.angle)
             normal = Vector2(-heading.y, heading.x)
-            _, _, segment, _ = self.track.nearest(follower.position)
-            track_width = self.track.width_at_segment(segment)
+            track_width = self.track.width_at_segment(
+                follower.track_segment
+            )
 
             target = follower.passing_target
             if (
@@ -4556,7 +5381,7 @@ class Game:
                     self.start_hotlap()
                     self.mode = "hotlap"
 
-        self.screen.fill(BG)
+        self.draw_app_background()
         self.text("TWO-LAP HOTLAP", (55, 35), "small", CYAN)
         self.text("One brain. One circuit. Two timed laps.", (55, 62), "title")
         self.text(
@@ -4564,42 +5389,63 @@ class Game:
             (58, 119), "body", MUTED,
         )
         preview = pygame.Rect(55, 165, 740, 500)
-        pygame.draw.rect(self.screen, (16, 34, 28), preview, border_radius=14)
-        pygame.draw.rect(self.screen, (45, 70, 60), preview, 1, border_radius=14)
+        self.glass_card(preview, accent=YELLOW, radius=18)
         self.track.draw_preview(self.screen, preview.inflate(-40, -40))
         self.text(self.track.name, (82, 190), "h2", YELLOW)
         self.text(
             f"{self.track.lap_length_m / 1000:.3f} km  •  2 laps",
             (84, 224), "small", WHITE,
         )
-        pygame.draw.rect(self.screen, (13, 29, 24), (825, 165, 410, 500), border_radius=14)
+        self.glass_card(
+            pygame.Rect(825, 165, 410, 500),
+            accent=CYAN,
+            radius=18,
+        )
         self.text("CIRCUIT", (850, 185), "small", MUTED)
-        pygame.draw.rect(self.screen, (25, 50, 41), track_rect, border_radius=8)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_HOVER, track_rect, border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER, track_rect, 1, border_radius=10
+        )
         self.text(
             f"‹  {self.track_label()[:26]}  ›",
             (track_rect.x + 18, track_rect.y + 14), "mono", CYAN,
         )
         self.text("AI BRAIN", (850, 270), "small", MUTED)
-        pygame.draw.rect(self.screen, (25, 50, 41), brain_rect, border_radius=8)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_HOVER, brain_rect, border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER, brain_rect, 1, border_radius=10
+        )
         self.text(
             self.brain_label(self.hotlap_brain)[:30],
             (brain_rect.x + 18, brain_rect.y + 18), "mono", WHITE,
         )
         for rect, label in ((previous_rect, "‹"), (next_rect, "›")):
-            pygame.draw.rect(self.screen, (28, 55, 45), rect, border_radius=7)
+            pygame.draw.rect(
+                self.screen, UI_SURFACE_HOVER, rect, border_radius=9
+            )
             rendered = self.fonts["h2"].render(label, True, CYAN)
             self.screen.blit(rendered, rendered.get_rect(center=rect.center))
         self.text(
             f"{len(self.brain_choices())} selectable brain source(s)",
             (1030, 398), "small", MUTED,
         )
-        pygame.draw.rect(self.screen, (25, 50, 41), era_rect, border_radius=8)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_HOVER, era_rect, border_radius=10
+        )
         self.text("POWERTRAIN", (era_rect.x + 16, era_rect.y + 13), "small", MUTED)
         self.text(
             f"‹  {self.hotlap_generation.upper()}  ›",
             (era_rect.x + 205, era_rect.y + 12), "small", YELLOW,
         )
-        pygame.draw.rect(self.screen, CYAN, start_rect, border_radius=9)
+        pygame.draw.rect(
+            self.screen, UI_SHADOW, start_rect.move(0, 5),
+            border_radius=11,
+        )
+        pygame.draw.rect(self.screen, CYAN, start_rect, border_radius=11)
         label = self.fonts["mono"].render("START TWO-LAP RUN", True, INK)
         self.screen.blit(label, label.get_rect(center=start_rect.center))
         self.text(
@@ -4632,6 +5478,8 @@ class Game:
 
     def hotlap(self, events, dt):
         for event in events:
+            if self.handle_camera_zoom_event(event):
+                continue
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.mode = "menu"
@@ -4640,13 +5488,9 @@ class Game:
                 elif event.key == pygame.K_r:
                     self.start_hotlap()
                 elif event.key == pygame.K_LEFTBRACKET:
-                    self.camera_zoom = max(
-                        MIN_CAMERA_ZOOM, self.camera_zoom / 1.2
-                    )
+                    self.adjust_camera_zoom(-1)
                 elif event.key == pygame.K_RIGHTBRACKET:
-                    self.camera_zoom = min(
-                        MAX_CAMERA_ZOOM, self.camera_zoom * 1.2
-                    )
+                    self.adjust_camera_zoom(1)
 
         car = self.hotlap_car
         if car is None:
@@ -4660,7 +5504,8 @@ class Game:
         self.track.draw(self.screen, camera_offset, camera_scale)
         car.draw(self.screen, True, camera_offset, camera_scale)
         self.screen.set_clip(None)
-        self.draw_minimap(self.cars, car)
+        self.draw_minimap([car], car)
+        self.draw_camera_zoom_control()
 
         self.panel(
             "Hotlap Complete" if self.hotlap_finished else "Two-Lap Hotlap",
@@ -4698,7 +5543,7 @@ class Game:
             self.text(result, (x + 14, 557), "h2", WHITE)
         state = "PAUSED" if self.paused else ("FINISHED" if self.hotlap_finished else "TIMED RUN")
         self.text(f"● {state}", (x, 640), "small", YELLOW if self.paused else CYAN)
-        self.footer_hint(("[R] Restart  •  [ / ] Camera", "[Space] Pause  •  [Esc] Back"))
+        self.footer_hint(("[R] Restart  •  Wheel/[ ] Zoom", "[Space] Pause  •  [Esc] Back"))
 
     def race_setup(self, events):
         """Configure the complete grid before a race can be launched."""
@@ -4913,14 +5758,21 @@ class Game:
                     else:
                         self.notice("Train at least one generation or export a champion first")
 
-        self.screen.fill(BG)
+        self.draw_app_background()
         self.text("RACE WEEKEND", (52, 30), "small", CYAN)
         self.text("Build the starting grid", (52, 57), "title")
         self.text(
             "Click to configure • double-click a driver to rename",
             (55, 112), "body", MUTED,
         )
-        pygame.draw.rect(self.screen, (20, 43, 35), setup["track"], border_radius=7)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED,
+            setup["track"], border_radius=9,
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER,
+            setup["track"], 1, border_radius=9,
+        )
         self.text("CIRCUIT", (setup["track"].x + 14, setup["track"].y + 11), "small", MUTED)
         self.text(
             f"‹  {self.track_label()[:25]}  ›",
@@ -4931,7 +5783,19 @@ class Game:
         for i, rect in enumerate(roster_rects):
             entry = self.race_entries[i]
             selected = i == self.selected_entry
-            pygame.draw.rect(self.screen, (28, 53, 44) if selected else (15, 31, 26), rect, border_radius=7)
+            pygame.draw.rect(
+                self.screen,
+                UI_SURFACE_HOVER if selected else UI_SURFACE,
+                rect,
+                border_radius=9,
+            )
+            pygame.draw.rect(
+                self.screen,
+                COLORS[entry["color"]] if selected else UI_BORDER,
+                rect,
+                1,
+                border_radius=9,
+            )
             pygame.draw.rect(self.screen, COLORS[entry["color"]], (rect.x + 7, rect.y + 7, 5, 26), border_radius=2)
             self.text(f"{i+1:>2}", (rect.x + 20, rect.y + 10), "mono", MUTED)
             display_name = (
@@ -4943,7 +5807,11 @@ class Game:
             self.text(display_name, (rect.x + 54, rect.y + 9), "mono", WHITE)
             self.text(entry["tyre"][0], (rect.right - 55, rect.y + 10), "mono", YELLOW)
 
-        pygame.draw.rect(self.screen, (15, 31, 26), (775, 132, 450, 278), border_radius=12)
+        self.glass_card(
+            pygame.Rect(775, 132, 450, 278),
+            accent=CYAN,
+            radius=16,
+        )
         self.text("SESSION", (800, 151), "small", YELLOW)
         for label, y, value, minus, plus in (
             ("CARS", 168, str(self.race_settings["cars"]), "cars_minus", "cars_plus"),
@@ -5042,6 +5910,8 @@ class Game:
 
     def race(self, events, dt):
         for event in events:
+            if self.handle_camera_zoom_event(event):
+                continue
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.mode = "menu"
@@ -5051,7 +5921,7 @@ class Game:
                     self.metric = (
                         self.metric
                         + (1 if event.key == pygame.K_RIGHT else -1)
-                    ) % 8
+                    ) % 9
                 elif event.key in (pygame.K_r, pygame.K_s):
                     self.save_replay()
                 elif event.key == pygame.K_y:
@@ -5069,13 +5939,9 @@ class Game:
                     self.cars[self.follow].puncture = True
                     self.log_event("puncture", f"{self.cars[self.follow].name} punctured", "high", self.follow)
                 elif event.key == pygame.K_LEFTBRACKET:
-                    self.camera_zoom = max(
-                        MIN_CAMERA_ZOOM, self.camera_zoom / 1.2
-                    )
+                    self.adjust_camera_zoom(-1)
                 elif event.key == pygame.K_RIGHTBRACKET:
-                    self.camera_zoom = min(
-                        MAX_CAMERA_ZOOM, self.camera_zoom * 1.2
-                    )
+                    self.adjust_camera_zoom(1)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.pos[0] >= CANVAS_W:
                 if 94 <= event.pos[1] <= 137:
                     self.event_camera = not self.event_camera
@@ -5152,6 +6018,7 @@ class Game:
             )
         self.screen.set_clip(None)
         self.draw_minimap(self.cars, focused_car)
+        self.draw_camera_zoom_control()
         self.draw_tower(ranked)
         if pygame.time.get_ticks() < self.weather_popup_until:
             popup = pygame.Rect(285, 30, 430, 82)
@@ -5224,15 +6091,37 @@ class Game:
             "INTERVAL", "GAP TO LEADER", "TYRE / AGE",
             "PIT STOPS", "CONDITION", "BATTERY / OVERTAKE",
             "FUEL / PIT CALL", "SPEED / GEAR / RPM",
+            "AGGRESSION / RISK",
         )
-        pygame.draw.rect(self.screen, (15, 30, 25), (x + 12, 143, PANEL - 24, 34), border_radius=7)
+        metric_card = pygame.Rect(x + 12, 143, PANEL - 24, 34)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED,
+            metric_card, border_radius=9,
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER,
+            metric_card, 1, border_radius=9,
+        )
         metric_text = self.fonts["small"].render(f"‹   {labels[self.metric]}   ›", True, CYAN)
         self.screen.blit(metric_text, metric_text.get_rect(center=(x + PANEL // 2, 160)))
         leader = ranked[0]
         for i, car in enumerate(ranked[:10]):
             y = 190 + i * 48
             focused = self.cars.index(car) == self.follow
-            pygame.draw.rect(self.screen, (24, 46, 38) if focused else (11, 24, 20), (x + 10, y, PANEL - 20, 41), border_radius=7)
+            row_rect = pygame.Rect(x + 10, y, PANEL - 20, 41)
+            pygame.draw.rect(
+                self.screen,
+                UI_SURFACE_HOVER if focused else UI_SURFACE,
+                row_rect,
+                border_radius=9,
+            )
+            pygame.draw.rect(
+                self.screen,
+                car.color if focused else UI_BORDER,
+                row_rect,
+                1,
+                border_radius=9,
+            )
             pygame.draw.rect(self.screen, car.color, (x + 15, y + 7, 5, 27), border_radius=2)
             self.text(f"{i+1:>2}", (x + 27, y + 10), "mono", WHITE if focused else MUTED)
             self.text(car.name, (x + 57, y + 6), "mono", WHITE)
@@ -5274,18 +6163,29 @@ class Game:
                     value = "ICE  •  NO BATTERY"
             elif self.metric == 6:
                 value = f"{car.fuel:4.1f}kg  {'PIT' if car.pit_requested else 'RUN'}"
-            else:
+            elif self.metric == 7:
                 value = (
                     f"{car.speed_kph:3.0f}km/h "
                     f"G{car.gear} {car.rpm / 1000:04.1f}k"
                 )
+            else:
+                risk = (
+                    "OVERCOMMIT"
+                    if car.aggression_error > 0.15
+                    else (
+                        "HESITATE"
+                        if car.aggression_error < -0.15
+                        else "PUSH"
+                    )
+                )
+                value = f"AGG {car.race_aggression * 100:3.0f}%  {risk}"
             self.text(value, (x + 148, y + 22), "small", CYAN if focused else MUTED)
         if len(ranked) > 10:
             self.text(f"+ {len(ranked)-10} MORE CARS", (x + 20, 675), "small", MUTED)
-        self.footer_hint(("[←/→] Metric  •  [ / ] Camera", "[Y/C/W/P] Events  •  [Esc] Back"))
+        self.footer_hint(("[←/→] Metric  •  Wheel/[ ] Zoom", "[Y/C/W/P] Events  •  [Esc] Back"))
 
     def draw_results(self, ranked):
-        self.screen.fill(BG)
+        self.draw_app_background()
         self.text("RACE CLASSIFICATION", (374, 42), "title")
         self.text(f"{self.track.name.upper()}  •  {self.target_laps} LAPS", (475, 98), "small", CYAN)
         podium = [c for c in ranked if c.finish_time is not None][:3]
@@ -5295,9 +6195,15 @@ class Game:
             if index < len(podium):
                 x, y, medal = box
                 car = podium[index]
-                pygame.draw.rect(self.screen, (6, 14, 12), (x, y + 6, 240, 176), border_radius=12)
-                pygame.draw.rect(self.screen, (25, 47, 40), (x, y, 240, 176), border_radius=12)
-                pygame.draw.rect(self.screen, medal, (x, y, 240, 8), border_radius=4)
+                self.glass_card(
+                    pygame.Rect(x, y, 240, 176),
+                    accent=medal,
+                    radius=16,
+                )
+                pygame.draw.rect(
+                    self.screen, medal, (x, y, 240, 5),
+                    border_radius=3,
+                )
                 self.text(f"P{index+1}", (x + 100, y + 25), "h2", medal)
                 name = self.fonts["h2"].render(car.name, True, car.color)
                 self.screen.blit(name, name.get_rect(center=(x + 120, y + 88)))
@@ -5308,7 +6214,13 @@ class Game:
         winner_time = podium[0].finish_time if podium else None
         for i, car in enumerate(ranked[:8]):
             y = 185 + i * 42
-            pygame.draw.rect(self.screen, (16, 31, 26), (table_x, y, 235, 34), border_radius=6)
+            row = pygame.Rect(table_x, y, 235, 34)
+            pygame.draw.rect(
+                self.screen, UI_SURFACE, row, border_radius=8
+            )
+            pygame.draw.rect(
+                self.screen, UI_BORDER, row, 1, border_radius=8
+            )
             self.text(f"{i+1:>2}  {car.name}", (table_x + 10, y + 8), "mono", car.color)
             if car.finish_time is None:
                 value = "DNF"
@@ -5328,6 +6240,15 @@ class Game:
             for event in raw_events:
                 if event.type == pygame.QUIT:
                     running = False
+                elif (
+                    event.type == pygame.KEYDOWN
+                    and event.key == pygame.K_l
+                    and self.mode != "name_dialog"
+                    and not event.mod & (
+                        pygame.KMOD_CTRL | pygame.KMOD_ALT | pygame.KMOD_GUI
+                    )
+                ):
+                    self.show_fps = not self.show_fps
             events = self.translate_events(raw_events)
             if self.mode == "menu":
                 self.menu(events)
@@ -5347,10 +6268,20 @@ class Game:
                 self.hotlap(events, dt)
             elif self.mode == "name_dialog":
                 self.draw_name_dialog(events)
+            if self.show_fps:
+                self.draw_fps_counter()
             if pygame.time.get_ticks() < self.message_until:
                 box = self.fonts["body"].render(self.message, True, INK)
-                rect = box.get_rect(center=(WIDTH // 2, HEIGHT - 35)).inflate(30, 16)
-                pygame.draw.rect(self.screen, YELLOW, rect, border_radius=8)
+                rect = box.get_rect(
+                    center=(WIDTH // 2, HEIGHT - 35)
+                ).inflate(38, 18)
+                pygame.draw.rect(
+                    self.screen, UI_SHADOW, rect.move(0, 4),
+                    border_radius=11,
+                )
+                pygame.draw.rect(
+                    self.screen, YELLOW, rect, border_radius=11
+                )
                 self.screen.blit(box, box.get_rect(center=rect.center))
             self.present()
         pygame.quit()
