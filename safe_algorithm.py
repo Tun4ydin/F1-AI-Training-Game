@@ -35,7 +35,7 @@ class SafeAlgorithm:
         "puncture", "rain", "slipstream", "lap", "lap_progress", "pitstops",
         "pit_available", "tyre_soft", "tyre_medium", "tyre_hard", "tyre_wet",
         "battery", "battery_percent", "regen", "is_hybrid",
-        "overtake_active", "off_track", "car_collision",
+        "overtake_active", "recharge_active", "off_track", "car_collision",
         "understeer", "oversteer", "racing_line_offset",
         "car_ahead", "car_ahead_distance", "car_ahead_side",
         "closing_speed", "passing", "passing_side",
@@ -55,11 +55,17 @@ class SafeAlgorithm:
         "opponent_3_velocity_forward", "opponent_3_velocity_right",
         "opponent_1_present", "opponent_2_present", "opponent_3_present",
         "previous_steering", "previous_throttle", "previous_brake",
+        "corner_curvature_10", "corner_curvature_20",
+        "corner_curvature_40",
+        "race_position", "field_size", "position_deficit",
+        "gap_to_leader_m", "gap_to_next_m",
+        "race_aggression", "aggression_error",
     }
     OUTPUT_NAMES = {"steering", "throttle"}
     OPTIONAL_OUTPUTS = {
         "brake": 0.0,
         "overtake": 0.0,
+        "recharge": 0.0,
         "pit_request": 0.0,
         "pit_tyre": 1.0,
     }
@@ -254,6 +260,7 @@ class SafeAlgorithm:
             clamp(float(environment["throttle"]), 0, 1),
             clamp(float(environment["brake"]), 0, 1),
             clamp(float(environment["overtake"]), 0, 1),
+            clamp(float(environment["recharge"]), 0, 1),
             clamp(float(environment["pit_request"]), 0, 1),
             int(round(clamp(float(environment["pit_tyre"]), 0, 3))),
         )

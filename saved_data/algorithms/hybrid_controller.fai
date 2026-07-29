@@ -1,11 +1,11 @@
-# Formula AI Hybrid Controller — Agile Waypoint v3.3
+# Formula AI Hybrid Controller — Agile Waypoint v3.7
 # Calibrated for the ratio-based gearbox, engine braking, aerodynamic drag,
 # cornering scrub, compound traction, and actual-value drivetrain telemetry.
 # Adds a full-width out-in-out racing line and progressive trail braking.
 #
 # Normalized inputs are still used for geometry and handling. Actual-value
 # inputs are used for speed, gear, RPM, and battery decisions:
-#   speed_kph, gear_number, rpm_value, battery_percent
+#   speed_kph, gear_number, rpm_value, battery_percent, recharge_active
 
 # Trainable steering and stability parameters.
 waypoint_gain      = parameter(0.94, 0.35, 1.60)
@@ -18,6 +18,8 @@ pass_gain          = parameter(1.85, 0.40, 2.50)
 awareness_range    = parameter(0.70, 0.30, 0.95)
 closing_trigger    = parameter(0.025, 0.00, 0.18)
 traffic_gain       = parameter(0.80, 0.10, 1.60)
+aggression_gain    = parameter(0.88, 0.30, 1.25)
+mistake_gain       = parameter(0.22, 0.08, 0.40)
 steering_smoothing = parameter(0.16, 0.00, 0.45)
 yaw_damping        = parameter(0.16, 0.00, 0.45)
 slide_correction   = parameter(0.34, 0.05, 0.80)
@@ -32,10 +34,16 @@ brake_gain         = parameter(1.48, 0.60, 2.40)
 engine_brake_band  = parameter(16.0, 6.0, 30.0)
 trail_brake_gain   = parameter(0.72, 0.30, 1.10)
 trail_release      = parameter(0.74, 0.45, 0.92)
+fast_corner_limit  = parameter(0.30, 0.18, 0.45)
+fast_corner_kph    = parameter(285.0, 250.0, 320.0)
 launch_deploy_kph  = parameter(205.0, 170.0, 230.0)
 straight_commit    = parameter(0.72, 0.50, 0.90)
 regen_gain         = parameter(0.68, 0.25, 1.10)
 deploy_level       = parameter(24.0, 8.0, 72.0)
+recharge_enter     = parameter(24.0, 8.0, 48.0)
+recharge_exit      = parameter(66.0, 38.0, 90.0)
+recharge_risk      = parameter(0.34, 0.00, 0.70)
+recharge_corner    = parameter(0.42, 0.10, 0.85)
 wear_caution       = parameter(0.28, 0.00, 0.60)
 pit_wear           = parameter(0.70, 0.40, 0.92)
 
@@ -44,6 +52,35 @@ actual_speed = speed_kph
 actual_gear = gear_number
 actual_rpm = rpm_value
 battery_soc = battery_percent
+recharging = recharge_active
+
+# Race aggression rises with position and gap pressure supplied by the race
+# simulation. The intermittent error pulse makes aggression risky instead of
+# turning it into a free pace increase.
+dynamic_aggression = clamp(
+    race_aggression * aggression_gain,
+    0.0,
+    1.0
+)
+mistake_signal = (
+    aggression_error * dynamic_aggression * mistake_gain
+)
+aggressive_track_usage = clamp(
+    track_usage + dynamic_aggression * 0.08,
+    0.50,
+    0.90
+)
+dynamic_awareness = clamp(
+    awareness_range + dynamic_aggression * 0.18,
+    0.30,
+    1.0
+)
+dynamic_closing_trigger = (
+    closing_trigger * (1.0 - dynamic_aggression * 0.75)
+)
+dynamic_pass_gain = pass_gain * (
+    1.0 + dynamic_aggression * 0.28
+)
 
 waypoint_command = (
     (waypoint_5_right * 0.34)
@@ -78,11 +115,11 @@ if (
     far_curve > 0.055
     and near_curve < far_curve * 0.82
 ):
-    racing_target = -turn_direction * track_usage
+    racing_target = -turn_direction * aggressive_track_usage
 
 # Turn-in and apex: cross the track and clip the inside.
 if near_curve > 0.065:
-    racing_target = turn_direction * track_usage * 0.92
+    racing_target = turn_direction * aggressive_track_usage * 0.92
 
 # Exit: let the car open its steering and run back to the outside edge.
 if (
@@ -91,13 +128,47 @@ if (
     and abs(previous_steering) > 0.10
 ):
     turn_direction = sign(previous_steering)
-    racing_target = -turn_direction * track_usage
+    racing_target = -turn_direction * aggressive_track_usage
+
+# A mistake can leave the car slightly too wide or too tight. The clamp keeps
+# even a maximum-risk error inside a recoverable corridor.
+racing_target = clamp(
+    racing_target + mistake_signal * 0.75,
+    -0.92,
+    0.92
+)
 
 racing_line_error = racing_target - racing_line_offset
 racing_line_weight = (
     center_gain
     + racing_line_gain
     * clamp(near_curve + middle_curve + far_curve, 0.0, 1.0)
+)
+
+# These sensors describe actual centreline curvature rather than the car's
+# displacement from the centre. A value near 0.2 is a fast sweep; values near
+# 1.0 describe hairpins and other very slow corners.
+near_severity = abs(corner_curvature_10)
+middle_severity = abs(corner_curvature_20)
+far_severity = abs(corner_curvature_40)
+corner_severity = clamp(
+    (near_severity * 0.52)
+    + (middle_severity * 0.32)
+    + (far_severity * 0.16),
+    0.0,
+    1.0
+)
+entry_severity = clamp(
+    (middle_severity * 0.62)
+    + (far_severity * 0.38),
+    0.0,
+    1.0
+)
+slow_corner_demand = clamp(
+    (entry_severity - fast_corner_limit)
+    / (1.0 - fast_corner_limit),
+    0.0,
+    1.0
 )
 
 left_space = (
@@ -139,10 +210,10 @@ learned_passing = 0.0
 clearing_pass = 0.0
 if (
     car_ahead > 0.5
-    and car_ahead_distance < awareness_range
+    and car_ahead_distance < dynamic_awareness
     and (
-        closing_speed > closing_trigger
-        or car_ahead_distance < awareness_range * 0.75
+        closing_speed > dynamic_closing_trigger
+        or car_ahead_distance < dynamic_awareness * 0.75
     )
 ):
     learned_passing = 1.0
@@ -173,7 +244,8 @@ pass_command = 0.0
 if active_passing > 0.5:
     path_command = waypoint_command * 0.20
     pass_command = (
-        (active_pass_side * 0.82 - racing_line_offset) * pass_gain
+        (active_pass_side * 0.82 - racing_line_offset)
+        * dynamic_pass_gain
     )
 
 desired_steering = (
@@ -182,6 +254,7 @@ desired_steering = (
     + (racing_line_error * racing_line_weight)
     + (edge_balance * ray_gain)
     + pass_command
+    + mistake_signal
 )
 desired_steering = (
     desired_steering
@@ -205,21 +278,22 @@ steering = clamp(
 if active_passing > 0.5:
     steering = clamp(
         (
-            (active_pass_side * 0.82 - racing_line_offset) * pass_gain
+            (active_pass_side * 0.82 - racing_line_offset)
+            * dynamic_pass_gain
             + heading_error * 1.10
         ),
         -1.0,
         1.0
     )
 
-# Corner demand now includes steering load because hard steering physically
-# scrubs speed in the revised car model.
+# Corner speed is based primarily on actual radius. Steering remains a small
+# stability correction, but an out-in-out lane change can no longer turn a
+# fast sweeper into a false hairpin.
 curve_demand = clamp(
-    (abs(waypoint_10_right) * 1.10)
-    + (abs(waypoint_20_right) * 0.88)
-    + (abs(waypoint_40_right) * 0.52)
-    + (abs(steering) * 0.16)
-    + (abs(racing_line_error) * 0.08),
+    (corner_severity * 0.88)
+    + (abs(steering) * 0.06)
+    + (understeer * 0.12)
+    + (oversteer * 0.16),
     0.0,
     1.0
 )
@@ -230,7 +304,8 @@ visibility = clamp(forward * 1.22, 0.24, 1.0)
 straight_confidence = clamp(
     ((forward - 0.68) * 2.80)
     - (curve_demand * 1.80)
-    - (abs(waypoint_20_right) * 0.55)
+    - (middle_severity * 0.42)
+    - (far_severity * 0.20)
     - (abs(heading_error) * 0.45)
     - (tire_slip * 0.60),
     0.0,
@@ -258,7 +333,11 @@ stint_pace = clamp(
 target_speed = clamp(
     (
         1.03
-        - (curve_demand * corner_caution)
+        - (
+            curve_demand
+            * corner_caution
+            * (1.0 - dynamic_aggression * 0.18)
+        )
         - (abs(steering) * 0.10)
         - (tire_slip * slip_caution)
     ) * visibility * stint_pace,
@@ -266,6 +345,24 @@ target_speed = clamp(
     1.0
 )
 target_speed_kph = target_speed * 360.0
+target_speed_kph = clamp(
+    target_speed_kph
+    + (dynamic_aggression * 12.0)
+    + (mistake_signal * 120.0),
+    65.0,
+    360.0
+)
+if (
+    corner_severity < fast_corner_limit
+    and forward > 0.55
+    and tire_slip < 0.18
+):
+    target_speed_kph = max(
+        target_speed_kph,
+        fast_corner_kph
+        - (rain * 70.0)
+        - (tyre_wear * 35.0)
+    )
 if straight_confidence > straight_commit:
     target_speed_kph = max(target_speed_kph, 358.0)
 speed_error_kph = target_speed_kph - actual_speed
@@ -303,8 +400,12 @@ if (
 battery_headroom = clamp((100.0 - battery_soc) / 35.0, 0.0, 1.0)
 regen_request = clamp(
     (
-        (curve_demand - 0.32) * regen_gain
-        + max(0.0, -speed_error_kph / 90.0) * brake_gain
+        (slow_corner_demand * regen_gain)
+        + (
+            max(0.0, -speed_error_kph / 90.0)
+            * brake_gain
+            * slow_corner_demand
+        )
     ) * (0.65 + battery_headroom * 0.35),
     0.0,
     0.72
@@ -320,28 +421,21 @@ if (
 # approach, then progressively bleed that pressure as steering load and the
 # near-apex signal rise. A small residual pressure remains through turn-in to
 # keep load on the front tyres, but it disappears as the car reaches the exit.
-entry_curve = clamp(
-    (far_curve * 1.15)
-    + (middle_curve * 0.85)
-    - 0.08,
-    0.0,
-    1.0
-)
 entry_brake = clamp(
-    (entry_curve * trail_brake_gain)
+    (slow_corner_demand * trail_brake_gain)
     + (max(0.0, -speed_error_kph / 95.0) * brake_gain),
     0.0,
     0.84
 )
 if (
     actual_speed > 85.0
-    and entry_curve > 0.08
+    and slow_corner_demand > 0.03
     and active_passing < 0.5
 ):
     brake = max(brake, entry_brake)
     turn_in_progress = clamp(
-        (near_curve * 1.55)
-        + (abs(steering) * 0.62),
+        (near_severity * 0.82)
+        + (abs(steering) * 0.35),
         0.0,
         1.0
     )
@@ -351,13 +445,27 @@ if (
         1.0
     )
     brake = brake * trail_multiplier
-    if near_curve > 0.04 and far_curve > 0.06:
+    if near_severity > fast_corner_limit and entry_severity > fast_corner_limit:
         brake = max(
             brake,
             entry_brake
             * 0.10
-            * clamp(1.0 - near_curve, 0.0, 1.0)
+            * clamp(1.0 - near_severity, 0.0, 1.0)
         )
+
+# Aggressive drivers brake slightly later. A positive mistake pulse can cause
+# an additional over-commitment; traffic collision avoidance below remains a
+# hard safety override.
+brake = clamp(
+    brake
+    * (
+        1.0
+        - dynamic_aggression * 0.10
+        - max(0.0, mistake_signal) * 0.35
+    ),
+    0.0,
+    0.84
+)
 if brake > 0.02:
     throttle = 0.0
 
@@ -409,7 +517,7 @@ if active_passing > 0.5:
         + (heading_error * 0.60)
         + (
             (active_pass_side * 0.82 - racing_line_offset)
-            * 1.80
+            * (1.80 + dynamic_aggression * 0.35)
         )
     )
     pass_steering = (
@@ -471,9 +579,9 @@ clear_straight = (
 launch_straight = (
     actual_speed < launch_deploy_kph
     and forward > 0.76
-    and abs(waypoint_10_right) < 0.065
-    and abs(waypoint_20_right) < 0.075
-    and abs(waypoint_40_right) < 0.085
+    and near_severity < 0.18
+    and middle_severity < 0.18
+    and far_severity < 0.18
     and car_ahead < 0.5
     and active_passing < 0.5
     and tire_slip < 0.22
@@ -485,10 +593,67 @@ if committed_acceleration > 0.5:
     throttle = 1.0
     brake = 0.0
 
+# Recharge is a trainable energy-management decision. Hysteresis comes from
+# recharge_active: once charging begins, the controller holds the mode until
+# the learned exit reserve is reached. Aggressive cars tolerate a lower reserve
+# before entering Recharge, while corner-heavy sections are preferred because
+# the temporary 70% combustion output costs less lap time there.
+effective_recharge_enter = recharge_enter * (
+    1.0 - dynamic_aggression * recharge_risk
+)
+effective_recharge_exit = max(
+    recharge_exit,
+    effective_recharge_enter + 10.0
+)
+recharge_need = clamp(
+    (
+        effective_recharge_exit - battery_soc
+    ) / max(effective_recharge_exit, 1.0),
+    0.0,
+    1.0
+)
+recharge_opportunity = clamp(
+    (
+        curve_demand * recharge_corner
+        + (1.0 - straight_confidence) * (1.0 - recharge_corner)
+        + recharge_need * 0.32
+        - active_passing * 0.75
+        - car_ahead * 0.22
+    ),
+    0.0,
+    1.0
+)
+recharge = 0.0
+if (
+    is_hybrid > 0.5
+    and recharging > 0.5
+    and battery_soc < effective_recharge_exit
+    and active_passing < 0.5
+):
+    recharge = 1.0
+if (
+    is_hybrid > 0.5
+    and recharging < 0.5
+    and battery_soc < effective_recharge_enter
+    and active_passing < 0.5
+    and (
+        recharge_opportunity > 0.38
+        or battery_soc < effective_recharge_enter * 0.55
+    )
+):
+    recharge = 1.0
+
 # Deploy on straights, near the top of a gear, or to complete a pass. Actual
 # battery percentage, gear number, and RPM remove normalized-unit ambiguity.
 overtake = 0.0
-if is_hybrid > 0.5 and battery_soc > deploy_level and (
+if (
+    is_hybrid > 0.5
+    and recharge < 0.5
+    and battery_soc > deploy_level * (
+        1.0 - dynamic_aggression * 0.35
+    )
+    and actual_gear >= 3.0
+    and (
     (
         launch_straight > 0.5
         and brake < 0.02
@@ -514,6 +679,7 @@ if is_hybrid > 0.5 and battery_soc > deploy_level and (
         and traction > 0.70
         and brake < 0.02
     )
+    )
 ):
     overtake = 1.0
 
@@ -532,6 +698,7 @@ if off_track > 0.5:
     brake = 0.0
     throttle = min(max(throttle, 0.18), 0.32)
     overtake = 0.0
+    recharge = 0.0
     steering = clamp(
         (heading_error * 1.45) - (racing_line_offset * 0.85),
         -1.0,
@@ -544,6 +711,11 @@ if car_collision > 0.5 and active_passing > 0.5:
         -1.0,
         1.0
     )
+
+# Recharge always wins the energy-mode arbitration. The car model applies the
+# 70% combustion share and blocks both normal Overtake and detector-based M.O.M.
+if recharge > 0.5:
+    overtake = 0.0
 
 pit_request = 0.0
 pit_tyre = 1.0

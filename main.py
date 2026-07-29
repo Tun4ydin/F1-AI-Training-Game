@@ -50,12 +50,21 @@ LOW_SPEED_TRACTION = 0.32
 FULL_TRACTION_SPEED = 0.60
 HYBRID_COMBUSTION_SHARE = 0.80
 HYBRID_ELECTRIC_SHARE = 0.20
+HYBRID_DRS_ELECTRIC_BONUS = 0.10
 HYBRID_TOTAL_POWER_SCALE = 1.1875
+HYBRID_REGEN_RATE = 0.16
+HYBRID_RECHARGE_RATE = 3.5 / FPS
+HYBRID_RECHARGE_COMBUSTION_SHARE = 0.70
 ROLLING_RESISTANCE = 0.00035
 AERO_DRAG_COEFFICIENT = 0.00076
+ICE_DRS_DRAG_MULTIPLIER = 0.80
+DRS_MAX_GAP_SECONDS = 1.0
 OPPONENT_SENSOR_RANGE_M = 60.0
 OVERTAKE_REWARD = 150.0
 OVERTAKE_COOLDOWN_FRAMES = FPS * 3
+LOW_SPEED_DNF_KPH = 10.0
+LOW_SPEED_DNF_SECONDS = 20.0
+FINISH_BRAKE_INPUT = 0.10
 # Boundary vision remains responsive at 20 Hz while the physics stays at
 # 60 Hz. Staggering the work is important when a full 20-car grid is active.
 RAYCAST_UPDATE_FRAMES = 3
@@ -142,6 +151,8 @@ class Track:
         self, points=None, name="Starter Ring", kerb_points=None, features=None,
         geometry="spline", declared_length_m=None, road_width_m=ROAD_W,
         road_widths_m=None, pitlane_points=None,
+        grass_widths_m=None, pitlane_road_widths_m=None,
+        pitlane_grass_widths_m=None,
     ):
         self.points = [Vector2(p) for p in (points or default_track())]
         self.name = name
@@ -163,6 +174,19 @@ class Track:
         self.variable_width = (
             max(self.road_widths_m) - min(self.road_widths_m) > 0.01
         )
+        default_grass_width = float(
+            (features or {}).get("border_margin", BORDER_W)
+        )
+        supplied_grass_widths = list(grass_widths_m or [])
+        self.grass_widths_m = [
+            clamp(
+                float(supplied_grass_widths[i])
+                if i < len(supplied_grass_widths)
+                else default_grass_width,
+                max(self.road_widths_m[i] + 4.0, 16.0), 80.0,
+            )
+            for i in range(len(self.points))
+        ]
         self.kerb_width_m = self.road_width_m + 2.0
         self.samples_per_section = 1 if geometry == "sampled" else self.SAMPLES_PER_SECTION
         self.kerb_points = set(kerb_points) if kerb_points is not None else self._automatic_kerbs()
@@ -171,22 +195,53 @@ class Track:
         ] if len(self.points) >= 8 else []
         base_features = {
             "start_finish": 0,
+            "pit_start_finish": None,
             "sectors": default_sectors,
             "pit_entry": None,
             "pit_exit": None,
             "pit_boxes": [],
+            "drs_detection": None,
+            "drs_entry": None,
+            "drs_exit": None,
             "border_margin": BORDER_W,
         }
         self.features = {**base_features, **(features or {})}
         self.pitlane_points = [
             Vector2(point) for point in (pitlane_points or [])
         ]
+        supplied_pit_widths = list(pitlane_road_widths_m or [])
+        supplied_pit_grass = list(pitlane_grass_widths_m or [])
+        self.pitlane_road_widths_m = [
+            clamp(
+                float(supplied_pit_widths[i])
+                if i < len(supplied_pit_widths)
+                else PITLANE_WIDTH_M,
+                4.0, 18.0,
+            )
+            for i in range(len(self.pitlane_points))
+        ]
+        self.pitlane_grass_widths_m = [
+            clamp(
+                float(supplied_pit_grass[i])
+                if i < len(supplied_pit_grass)
+                else max(PITLANE_WIDTH_M + 2.0, 16.0),
+                max(self.pitlane_road_widths_m[i] + 2.0, 8.0), 60.0,
+            )
+            for i in range(len(self.pitlane_points))
+        ]
         (
             self.centerline,
             self.kerb_segments,
             self.centerline_widths_m,
+            self.centerline_grass_widths_m,
         ) = self._build_spline()
         self.pitlane_centerline = self._build_pitlane()
+        self.pitlane_centerline_widths_m = self._pitlane_sample_widths(
+            self.pitlane_road_widths_m, PITLANE_WIDTH_M
+        )
+        self.pitlane_centerline_grass_widths_m = self._pitlane_sample_widths(
+            self.pitlane_grass_widths_m, PITLANE_WIDTH_M + 2.0
+        )
         self._pit_box_positions_cache = None
         self._ribbon_cache = {}
         self.segment_lengths_m = [
@@ -248,14 +303,16 @@ class Track:
                 [point.copy() for point in self.points],
                 kerbs,
                 list(self.road_widths_m),
+                list(self.grass_widths_m),
             )
         if count < 4:
             return (
                 [p.copy() for p in self.points],
                 [False] * count,
                 list(self.road_widths_m),
+                list(self.grass_widths_m),
             )
-        curve, kerbs, widths = [], [], []
+        curve, kerbs, widths, grass_widths = [], [], [], []
         for i in range(count):
             p0 = self.points[(i - 1) % count]
             p1 = self.points[i]
@@ -275,7 +332,14 @@ class Track:
                         - self.road_widths_m[i]
                     ) * t
                 )
-        return curve, kerbs, widths
+                grass_widths.append(
+                    self.grass_widths_m[i]
+                    + (
+                        self.grass_widths_m[(i + 1) % count]
+                        - self.grass_widths_m[i]
+                    ) * t
+                )
+        return curve, kerbs, widths, grass_widths
 
     def set_kerb_points(self, indexes):
         self.kerb_points = set(indexes)
@@ -283,7 +347,23 @@ class Track:
             self.centerline,
             self.kerb_segments,
             self.centerline_widths_m,
+            self.centerline_grass_widths_m,
         ) = self._build_spline()
+
+    def _main_tangent_at_control(self, control_index):
+        """Return a smooth forward tangent at a main-track control node."""
+        spline_index = (
+            int(control_index) * self.samples_per_section
+        ) % len(self.centerline)
+        previous = self.centerline[spline_index - 1]
+        following = self.centerline[
+            (spline_index + 1) % len(self.centerline)
+        ]
+        tangent = following - previous
+        return (
+            tangent.normalize()
+            if tangent.length_squared() else Vector2(1, 0)
+        )
 
     def _pitlane_edge_anchor(self, control_index, toward, is_entry):
         """Return the local asphalt edge facing an authored pit-road node."""
@@ -291,26 +371,50 @@ class Track:
             int(control_index) * self.samples_per_section
         ) % len(self.centerline)
         centre = self.centerline[spline_index]
-        if is_entry:
-            neighbour = self.centerline[
-                (spline_index + 1) % len(self.centerline)
-            ]
-            tangent = neighbour - centre
-        else:
-            neighbour = self.centerline[spline_index - 1]
-            tangent = centre - neighbour
-        if not tangent.length_squared():
-            tangent = Vector2(1, 0)
-        else:
-            tangent = tangent.normalize()
+        tangent = self._main_tangent_at_control(control_index)
         normal = Vector2(-tangent.y, tangent.x)
         toward_edge = Vector2(toward) - centre
         side = 1.0 if toward_edge.dot(normal) >= 0.0 else -1.0
         half_width = self.centerline_widths_m[spline_index] / 2
         return centre + normal * side * half_width
 
+    @staticmethod
+    def _pit_transition_curve(
+        start, end, start_tangent, end_tangent
+    ):
+        """Build a tangent-matched cubic connector without sharp wedges."""
+        start, end = Vector2(start), Vector2(end)
+        distance = start.distance_to(end)
+        if distance <= 1e-6:
+            return [start]
+        start_tangent = (
+            Vector2(start_tangent).normalize()
+            if Vector2(start_tangent).length_squared()
+            else (end - start).normalize()
+        )
+        end_tangent = (
+            Vector2(end_tangent).normalize()
+            if Vector2(end_tangent).length_squared()
+            else (end - start).normalize()
+        )
+        handle = clamp(distance * 0.34, 3.0, 22.0)
+        control_1 = start + start_tangent * handle
+        control_2 = end - end_tangent * handle
+        segments = int(clamp(math.ceil(distance / 3.5), 7, 18))
+        curve = []
+        for index in range(segments + 1):
+            t = index / segments
+            inverse = 1.0 - t
+            curve.append(
+                start * inverse ** 3
+                + control_1 * (3.0 * inverse ** 2 * t)
+                + control_2 * (3.0 * inverse * t ** 2)
+                + end * t ** 3
+            )
+        return curve
+
     def _build_pitlane(self):
-        """Connect authored pit nodes between the main road's asphalt edges."""
+        """Connect pit nodes with smooth entry and exit transition curves."""
         entry = self.features.get("pit_entry")
         exit_index = self.features.get("pit_exit")
         if (
@@ -333,11 +437,78 @@ class Track:
         exit_anchor = self._pitlane_edge_anchor(
             exit_index, self.pitlane_points[-1], False
         )
+        if len(self.pitlane_points) >= 2:
+            entry_direction = (
+                self.pitlane_points[1] - self.pitlane_points[0]
+            )
+            exit_direction = (
+                self.pitlane_points[-1] - self.pitlane_points[-2]
+            )
+        else:
+            entry_direction = exit_anchor - self.pitlane_points[0]
+            exit_direction = entry_direction.copy()
+        entry_curve = self._pit_transition_curve(
+            entry_anchor, self.pitlane_points[0],
+            self._main_tangent_at_control(entry), entry_direction,
+        )
+        exit_curve = self._pit_transition_curve(
+            self.pitlane_points[-1], exit_anchor,
+            exit_direction, self._main_tangent_at_control(exit_index),
+        )
         return [
-            entry_anchor,
+            *entry_curve[:-1],
             *(point.copy() for point in self.pitlane_points),
-            exit_anchor,
+            *exit_curve[1:],
         ]
+
+    def _pitlane_sample_widths(self, control_widths, fallback):
+        """Smooth authored pit-node widths across the rendered centreline."""
+        if not self.pitlane_centerline:
+            return []
+        if not self.pitlane_points or not control_widths:
+            return [float(fallback)] * len(self.pitlane_centerline)
+        if len(self.pitlane_points) == 1:
+            return [float(control_widths[0])] * len(self.pitlane_centerline)
+        sampled = []
+        for point in self.pitlane_centerline:
+            best_distance = float("inf")
+            best_width = float(control_widths[0])
+            for index in range(len(self.pitlane_points) - 1):
+                distance, _, ratio = seg_distance(
+                    point, self.pitlane_points[index],
+                    self.pitlane_points[index + 1],
+                )
+                if distance < best_distance:
+                    best_distance = distance
+                    best_width = (
+                        control_widths[index]
+                        + (
+                            control_widths[index + 1]
+                            - control_widths[index]
+                        ) * ratio
+                    )
+            sampled.append(float(best_width))
+        return sampled
+
+    @staticmethod
+    def open_ribbon_edges(points, widths):
+        """Build joined left/right edges for an open variable-width road."""
+        count = len(points)
+        if count < 2:
+            return [], []
+        left, right = [], []
+        for index, point in enumerate(points):
+            previous = points[max(0, index - 1)]
+            following = points[min(count - 1, index + 1)]
+            tangent = following - previous
+            if tangent.length_squared() <= 1e-12:
+                tangent = Vector2(1, 0)
+            tangent = tangent.normalize()
+            normal = Vector2(-tangent.y, tangent.x)
+            half_width = max(0.5, float(widths[index]) / 2)
+            left.append(point + normal * half_width)
+            right.append(point - normal * half_width)
+        return left, right
 
     def pitlane_nearest(self, point):
         """Return distance and position on the open pitlane polyline."""
@@ -353,10 +524,101 @@ class Track:
                 best = (distance, nearest, index, ratio)
         return best
 
+    def pitlane_point_ahead(self, point, lookahead_m=14.0):
+        """Return a forward target along the open pit-lane centreline."""
+        if len(self.pitlane_centerline) < 2:
+            return None
+        _, nearest, segment, _ = self.pitlane_nearest(point)
+        if segment is None:
+            return None
+        target = nearest
+        remaining = max(0.0, float(lookahead_m))
+        for index in range(segment, len(self.pitlane_centerline) - 1):
+            endpoint = self.pitlane_centerline[index + 1]
+            segment_length = target.distance_to(endpoint)
+            if segment_length >= remaining and segment_length > 1e-9:
+                return target.lerp(endpoint, remaining / segment_length)
+            remaining -= segment_length
+            target = endpoint
+        return self.pitlane_centerline[-1].copy()
+
     def is_in_pitlane(self, point):
-        return (
-            len(self.pitlane_centerline) >= 2
-            and self.pitlane_nearest(point)[0] <= PITLANE_WIDTH_M / 2
+        if len(self.pitlane_centerline) < 2:
+            return False
+        distance, _, segment, ratio = self.pitlane_nearest(point)
+        if segment is None:
+            return False
+        widths = self.pitlane_centerline_widths_m
+        width = widths[segment] + (
+            widths[min(segment + 1, len(widths) - 1)] - widths[segment]
+        ) * ratio
+        return distance <= width / 2
+
+    def timing_line(self, pitlane=False):
+        """Return timing-line centre, forward tangent, and half width."""
+        if pitlane:
+            marker = self.features.get("pit_start_finish")
+            points = self.pitlane_points
+            if marker is None or not points:
+                return None
+            index = int(marker)
+            if not 0 <= index < len(points):
+                return None
+            centre = points[index]
+            previous = points[max(0, index - 1)]
+            following = points[min(len(points) - 1, index + 1)]
+            tangent = following - previous
+            half_width = PITLANE_WIDTH_M / 2
+        else:
+            if not self.points or not self.centerline:
+                return None
+            control_index = (
+                int(self.features.get("start_finish", 0))
+                % len(self.points)
+            )
+            index = control_index * self.samples_per_section
+            centre = self.centerline[index]
+            following = self.centerline[
+                (index + 1) % len(self.centerline)
+            ]
+            tangent = following - centre
+            half_width = self.centerline_widths_m[index] / 2
+        if not tangent.length_squared():
+            return None
+        return centre, tangent.normalize(), half_width
+
+    def feature_line(self, feature):
+        """Return a full-width line for a main-track control-node feature."""
+        marker = self.features.get(feature)
+        if marker is None or not self.points or not self.centerline:
+            return None
+        control_index = int(marker)
+        if not 0 <= control_index < len(self.points):
+            return None
+        index = control_index * self.samples_per_section
+        centre = self.centerline[index]
+        tangent = self._main_tangent_at_control(control_index)
+        return centre, tangent, self.centerline_widths_m[index] / 2
+
+    def crossed_timing_line(self, previous, current, pitlane=False):
+        """Detect a forward centre-point crossing of a timing line."""
+        timing_line = self.timing_line(pitlane)
+        if timing_line is None:
+            return False
+        centre, tangent, half_width = timing_line
+        previous = Vector2(previous)
+        current = Vector2(current)
+        before = (previous - centre).dot(tangent)
+        after = (current - centre).dot(tangent)
+        if before >= -1e-4 or after < 0.0:
+            return False
+        distance = after - before
+        if distance <= 1e-9:
+            return False
+        crossing = previous.lerp(current, -before / distance)
+        normal = Vector2(-tangent.y, tangent.x)
+        return abs((crossing - centre).dot(normal)) <= (
+            half_width + CAR_WIDTH_M / 2
         )
 
     def pit_box_positions(self):
@@ -531,7 +793,14 @@ class Track:
             return "asphalt"
         if distance <= (local_width + 2.0) / 2 and self.kerb_segments[index]:
             return "kerb"
-        if distance <= float(self.features["border_margin"]) / 2:
+        current_grass = self.centerline_grass_widths_m[index]
+        following_grass = self.centerline_grass_widths_m[
+            (index + 1) % len(self.centerline_grass_widths_m)
+        ]
+        grass_width = current_grass + (
+            following_grass - current_grass
+        ) * t
+        if distance <= grass_width / 2:
             return "grass"
         return "wall"
 
@@ -548,13 +817,22 @@ class Track:
         if len(pts) < 2:
             return
         visible = self.visible_segments(screen, offset, scale)
+        pit_points = (
+            self._screen_points(
+                self.pitlane_centerline, offset, scale
+            )
+            if len(self.pitlane_centerline) >= 2 else []
+        )
 
         # Every visual layer is derived from the same mitered ribbon vertices.
         # This removes the triangular gaps produced by independent thick-line
         # caps at sharp or variable-width nodes.
         border_widths = [
-            max(width + 4.0, float(self.features["border_margin"]))
-            for width in self.centerline_widths_m
+            max(width + 4.0, grass_width)
+            for width, grass_width in zip(
+                self.centerline_widths_m,
+                self.centerline_grass_widths_m,
+            )
         ]
         border_left, border_right = self.ribbon_edges(border_widths)
         border_left_px = self._screen_points(border_left, offset, scale)
@@ -570,6 +848,27 @@ class Track:
                     border_right_px[index],
                 ),
             )
+        if pit_points:
+            pit_border_left, pit_border_right = self.open_ribbon_edges(
+                self.pitlane_centerline,
+                self.pitlane_centerline_grass_widths_m,
+            )
+            pit_border_left_px = self._screen_points(
+                pit_border_left, offset, scale
+            )
+            pit_border_right_px = self._screen_points(
+                pit_border_right, offset, scale
+            )
+            for index in range(len(pit_points) - 1):
+                pygame.draw.polygon(
+                    screen, (17, 43, 28),
+                    (
+                        pit_border_left_px[index],
+                        pit_border_left_px[index + 1],
+                        pit_border_right_px[index + 1],
+                        pit_border_right_px[index],
+                    ),
+                )
 
         road_left, road_right = self.ribbon_edges(
             self.centerline_widths_m
@@ -615,30 +914,6 @@ class Track:
                     road_right_px[index],
                 ),
             )
-        if len(self.pitlane_centerline) >= 2:
-            pit_points = self._screen_points(
-                self.pitlane_centerline, offset, scale
-            )
-            border_width = max(
-                2, int(round((PITLANE_WIDTH_M + 2.0) * scale))
-            )
-            road_width = max(
-                1, int(round(PITLANE_WIDTH_M * scale))
-            )
-            pygame.draw.lines(
-                screen, (17, 43, 28), False, pit_points, border_width
-            )
-            pygame.draw.lines(
-                screen, (67, 70, 74), False, pit_points, road_width
-            )
-            joint_radius = max(1, road_width // 2)
-            for pit_point in pit_points[1:-1]:
-                pygame.draw.circle(
-                    screen, (67, 70, 74), pit_point, joint_radius
-                )
-            pygame.draw.aalines(
-                screen, (160, 164, 164), False, pit_points
-            )
         edge_color = (112, 116, 117)
         if len(visible) < len(pts) * 0.65:
             for index in visible:
@@ -654,16 +929,76 @@ class Track:
         else:
             pygame.draw.aalines(screen, edge_color, True, road_left_px)
             pygame.draw.aalines(screen, edge_color, True, road_right_px)
-        # One start/finish line; editor control points are not physical seams.
-        if len(self.centerline) > 1:
-            start_index = int(self.features.get("start_finish", 0)) % len(self.points)
-            spline_index = start_index * self.samples_per_section
-            p = self.centerline[spline_index] * scale + offset
-            q = self.centerline[(spline_index + 1) % len(self.centerline)] * scale + offset
-            tangent = (q - p).normalize()
+        if pit_points:
+            # Asphalt is the final road layer so it opens a clean, seamless
+            # mouth through the main-track edge at pit entry and exit.
+            pit_road_left, pit_road_right = self.open_ribbon_edges(
+                self.pitlane_centerline,
+                self.pitlane_centerline_widths_m,
+            )
+            pit_road_left_px = self._screen_points(
+                pit_road_left, offset, scale
+            )
+            pit_road_right_px = self._screen_points(
+                pit_road_right, offset, scale
+            )
+            for index in range(len(pit_points) - 1):
+                pygame.draw.polygon(
+                    screen, (67, 70, 74),
+                    (
+                        pit_road_left_px[index],
+                        pit_road_left_px[index + 1],
+                        pit_road_right_px[index + 1],
+                        pit_road_right_px[index],
+                    ),
+                )
+            pygame.draw.aalines(
+                screen, (160, 164, 164), False, pit_road_left_px
+            )
+            pygame.draw.aalines(
+                screen, (160, 164, 164), False, pit_road_right_px
+            )
+        # Main and pit timing lines share the same directional crossing model.
+        timing_line = self.timing_line()
+        if timing_line is not None:
+            centre, tangent, half_width = timing_line
+            p = centre * scale + offset
             normal = Vector2(-tangent.y, tangent.x)
-            local_width = self.centerline_widths_m[spline_index]
-            pygame.draw.line(screen, YELLOW, p - normal * local_width * scale / 2, p + normal * local_width * scale / 2, max(1, int(scale)))
+            pygame.draw.line(
+                screen, YELLOW,
+                p - normal * half_width * scale,
+                p + normal * half_width * scale,
+                max(1, int(scale)),
+            )
+        pit_timing_line = self.timing_line(pitlane=True)
+        if pit_timing_line is not None:
+            centre, tangent, half_width = pit_timing_line
+            p = centre * scale + offset
+            normal = Vector2(-tangent.y, tangent.x)
+            pygame.draw.line(
+                screen, (255, 214, 80),
+                p - normal * half_width * scale,
+                p + normal * half_width * scale,
+                max(1, int(scale)),
+            )
+        drs_colors = {
+            "drs_detection": (255, 196, 61),
+            "drs_entry": (38, 211, 126),
+            "drs_exit": (239, 82, 92),
+        }
+        for feature, color in drs_colors.items():
+            feature_line = self.feature_line(feature)
+            if feature_line is None:
+                continue
+            centre, tangent, half_width = feature_line
+            p = centre * scale + offset
+            normal = Vector2(-tangent.y, tangent.x)
+            pygame.draw.line(
+                screen, color,
+                p - normal * half_width * scale,
+                p + normal * half_width * scale,
+                max(2, int(1.4 * scale)),
+            )
         for control_index in self.features.get("sectors", []):
             if not self.points:
                 continue
@@ -755,6 +1090,9 @@ class Track:
             "road_width_m": self.road_width_m,
             "road_widths_m": self.road_widths_m,
             "pitlane_points": [list(point) for point in self.pitlane_points],
+            "grass_widths_m": self.grass_widths_m,
+            "pitlane_road_widths_m": self.pitlane_road_widths_m,
+            "pitlane_grass_widths_m": self.pitlane_grass_widths_m,
         }, indent=2))
         self.name = safe
         return path
@@ -772,6 +1110,9 @@ class Track:
             data.get("road_width_m", ROAD_W),
             data.get("road_widths_m"),
             data.get("pitlane_points"),
+            data.get("grass_widths_m"),
+            data.get("pitlane_road_widths_m"),
+            data.get("pitlane_grass_widths_m"),
         )
 
 
@@ -784,7 +1125,7 @@ class Brain:
         "puncture", "rain", "slipstream", "lap", "lap_progress", "pitstops",
         "pit_available", "tyre_soft", "tyre_medium", "tyre_hard", "tyre_wet",
         "battery", "battery_percent", "regen", "is_hybrid",
-        "overtake_active", "off_track", "car_collision",
+        "overtake_active", "recharge_active", "off_track", "car_collision",
         "understeer", "oversteer", "racing_line_offset",
         "car_ahead", "car_ahead_distance", "car_ahead_side",
         "closing_speed", "passing", "passing_side",
@@ -836,10 +1177,14 @@ class Brain:
         state = dict(zip(self.INPUT_NAMES, inputs))
         if self.program:
             try:
-                return self.program.run(state, self.parameters)
+                result = self.program.run(state, self.parameters)
+                if len(result) == 6:
+                    # Brains compiled by the pre-Recharge parser remain valid.
+                    return (*result[:4], 0.0, *result[4:])
+                return result
             except (AlgorithmError, ArithmeticError, KeyError, TypeError, ValueError):
                 # A bad runtime calculation stops this agent safely, never the game.
-                return 0.0, 0.0, 0.0, 0.0, 0.0, 1
+                return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1
         outputs = []
         for row in self.weights:
             outputs.append(math.tanh(sum(a * b for a, b in zip(row[:-1], inputs)) + row[-1]))
@@ -880,9 +1225,13 @@ class Brain:
             and abs(steer) <= 0.20
             and brake <= 0.05
         )
+        recharge = (
+            state.get("is_hybrid", 0) >= 0.5
+            and state.get("battery", 1.0) <= 0.20
+        )
         return (
             steer, throttle, brake, float(overtake),
-            float(pit_request), pit_tyre,
+            float(recharge), float(pit_request), pit_tyre,
         )
 
     def mutate(self, amount=None):
@@ -970,6 +1319,11 @@ class Brain:
             return migrated
         return source
 
+    @staticmethod
+    def compile_source(source):
+        """Compile current controllers with native Recharge output support."""
+        return SafeAlgorithm(source)
+
     @classmethod
     def load_file(cls, path):
         try:
@@ -977,7 +1331,7 @@ class Brain:
             if data.get("source"):
                 stored_source = data["source"]
                 source = cls.migrate_legacy_source(stored_source)
-                program = SafeAlgorithm(source)
+                program = cls.compile_source(source)
                 return cls(
                     config=data.get("algorithm"),
                     program=program,
@@ -1022,6 +1376,7 @@ class Car:
     lap: int = 0
     checkpoint: int = 0
     score: float = 0.0
+    race_distance_m: float | None = None
     fitness: float = 0.0
     forward_distance_m: float = 0.0
     reverse_distance_m: float = 0.0
@@ -1037,11 +1392,19 @@ class Car:
     puncture: bool = False
     pitstops: int = 0
     finish_time: float | None = None
+    retirement_time: float | None = None
+    retirement_reason: str = ""
+    low_speed_seconds: float = 0.0
+    removed_from_track: bool = False
+    starting_position: int = 1
     previous_progress: float = 0.0
     previous_progress_m: float | None = None
     outside_limits: bool = False
     pit_timer: float = 0.0
     pit_requested: bool = False
+    pit_entry_committed: bool = False
+    pit_exit_straight_frames: float = 0.0
+    pit_exit_guidance_frames: float = 0.0
     requested_tyre: int = 1
     slipstream: float = 0.0
     drafting_car: str = ""
@@ -1052,6 +1415,11 @@ class Car:
     battery: float = 100.0
     battery_regen: float = 0.0
     overtake_active: bool = False
+    recharge_active: bool = False
+    drs_eligible: bool = False
+    drs_active: bool = False
+    drs_in_zone: bool = False
+    drs_gap_seconds: float = float("inf")
     brake_input: float = 0.0
     car_collision: bool = False
     understeer: float = 0.0
@@ -1084,6 +1452,9 @@ class Car:
     )
     aggression_mistake_cooldown: float = field(
         default=0.0, repr=False, compare=False
+    )
+    timing_history: list = field(
+        default_factory=list, repr=False, compare=False
     )
     opponent_data: tuple = field(
         default_factory=lambda: (0.0,) * 12,
@@ -1118,6 +1489,42 @@ class Car:
     @property
     def speed_kph(self):
         return self.velocity.length() * FPS * 3.6
+
+    def advance_after_finish(self, track, dt=1.0):
+        """Follow the circuit under 10% braking, then leave the track."""
+        if self.removed_from_track:
+            return
+        speed = self.velocity.length()
+        braking_delta = FINISH_BRAKE_INPUT * 0.028 * dt
+        remaining_speed = max(0.0, speed - braking_delta)
+        if remaining_speed <= 1e-6:
+            self.velocity.update(0.0, 0.0)
+            self.removed_from_track = True
+            return
+        progress_m = track.progress_metres(self.position)
+        target = track.point_at_distance(
+            progress_m + clamp(remaining_speed * 28.0, 12.0, 26.0)
+        )
+        desired = target - self.position
+        current_direction = (
+            self.velocity.normalize()
+            if self.velocity.length_squared()
+            else Vector2(1, 0).rotate(self.angle)
+        )
+        if desired.length_squared():
+            blended = current_direction.lerp(
+                desired.normalize(), clamp(0.10 * dt, 0.0, 0.35)
+            )
+            if blended.length_squared():
+                current_direction = blended.normalize()
+        self.velocity = current_direction * remaining_speed
+        self.angle = math.degrees(
+            math.atan2(current_direction.y, current_direction.x)
+        )
+        self.brake_input = FINISH_BRAKE_INPUT
+        self.throttle_input = 0.0
+        self.steering_input = 0.0
+        self.position += self.velocity * dt
 
     def update_drivetrain(self, throttle=0.0):
         """Update the automatic eight-speed gearbox and 13,000 RPM engine."""
@@ -1317,11 +1724,15 @@ class Car:
             ),
             self.battery if self.generation == "Hybrid" else 0.0,
             (
-                clamp(self.battery_regen / 0.05, 0.0, 1.0)
+                clamp(
+                    self.battery_regen / HYBRID_REGEN_RATE,
+                    0.0, 1.0,
+                )
                 if self.generation == "Hybrid" else 0.0
             ),
             float(self.generation == "Hybrid"),
             float(self.overtake_active),
+            float(self.recharge_active),
             float(self.outside_limits),
             float(self.car_collision),
             clamp(self.understeer, 0.0, 1.0),
@@ -1363,12 +1774,176 @@ class Car:
             clamp(self.aggression_error, -1.0, 1.0),
         ]
 
+    def pit_guidance(self, track, steer, throttle, brake):
+        """Guide a committed stop through pit entry, lane, and exit."""
+        if len(track.pitlane_centerline) < 2:
+            self.pit_entry_committed = False
+            self.pit_exit_straight_frames = 0.0
+            self.pit_exit_guidance_frames = 0.0
+            return steer, throttle, brake
+        target = None
+        entry_distance = float("inf")
+        recovering_from_runoff = False
+        straight_exit = False
+        if self.in_pitlane:
+            self.pit_entry_committed = False
+            if self.position.distance_to(
+                track.pitlane_centerline[-1]
+            ) <= 40.0:
+                # Keep control through the merge after the centre leaves the
+                # narrow pit-lane ribbon.
+                self.pit_exit_straight_frames = FPS * 0.5
+                self.pit_exit_guidance_frames = 90.0
+            target = track.pitlane_point_ahead(
+                self.position,
+                clamp(self.velocity.length() * 32.0, 10.0, 24.0),
+            )
+        elif self.pit_exit_straight_frames > 0.0:
+            self.pit_exit_straight_frames = max(
+                0.0, self.pit_exit_straight_frames - 1.0
+            )
+            straight_exit = True
+            target = None
+        elif self.pit_exit_guidance_frames > 0.0:
+            self.pit_exit_guidance_frames = max(
+                0.0, self.pit_exit_guidance_frames - 1.0
+            )
+            current_progress_m = track.progress_metres(self.position)
+            target = track.point_at_distance(
+                current_progress_m
+                + clamp(self.velocity.length() * 28.0, 20.0, 34.0)
+            )
+        elif self.pit_requested:
+            entry = track.features.get("pit_entry")
+            if entry is None or not track.points:
+                return steer, throttle, brake
+            entry_segment = (
+                int(entry) % len(track.points)
+            ) * track.samples_per_section
+            entry_progress_m = track.cumulative_lengths_m[entry_segment]
+            current_progress_m = track.progress_metres(self.position)
+            entry_distance = (
+                entry_progress_m - current_progress_m
+            ) % max(track.measured_length_m, 1e-9)
+            if entry_distance <= 130.0:
+                self.pit_entry_committed = True
+            if not self.pit_entry_committed:
+                return steer, throttle, brake
+            if entry_distance <= 130.0:
+                lookahead = clamp(
+                    self.velocity.length() * 20.0, 14.0, 34.0
+                )
+                main_target = track.point_at_distance(
+                    current_progress_m
+                    + min(lookahead, max(entry_distance, 0.0))
+                )
+                merge = clamp(
+                    (55.0 - entry_distance) / 45.0, 0.0, 1.0
+                )
+                pit_target = track.pitlane_centerline[0].lerp(
+                    track.pitlane_centerline[1],
+                    clamp((merge - 0.62) / 0.38, 0.0, 1.0),
+                )
+                target = main_target.lerp(pit_target, merge)
+            else:
+                # The commitment stays active if contact or a mistake carries
+                # the car just beyond the entry. Aim it back at the pit road
+                # instead of abandoning the stop for an entire extra lap.
+                target = track.pitlane_centerline[
+                    min(1, len(track.pitlane_centerline) - 1)
+                ]
+        else:
+            self.pit_entry_committed = False
+            return steer, throttle, brake
+
+        recovering_from_runoff = (
+            (
+                self.pit_entry_committed or self.in_pitlane
+                or self.pit_exit_straight_frames > 0.0
+                or self.pit_exit_guidance_frames > 0.0
+            )
+            and track.surface(self.position)
+            not in ("asphalt", "kerb", "pitlane")
+        )
+        if recovering_from_runoff:
+            # Once a committed car leaves the paved merge, stop following the
+            # normal racing-line blend and aim directly into the pit route.
+            target = (
+                track.pitlane_point_ahead(self.position, 8.0)
+                if self.in_pitlane
+                else track.point_at_distance(
+                    track.progress_metres(self.position) + 20.0
+                )
+                if self.pit_exit_guidance_frames > 0.0
+                else track.pitlane_centerline[
+                    min(1, len(track.pitlane_centerline) - 1)
+                ]
+            )
+
+        speed = self.velocity.length()
+        target_speed = PIT_SPEED_LIMIT_MPF * (
+            0.82 if self.in_pitlane else 0.95
+        )
+        if speed > target_speed:
+            throttle = 0.0
+            brake = max(
+                brake,
+                clamp(
+                    (speed - target_speed)
+                    / max(PIT_SPEED_LIMIT_MPF, 1e-9),
+                    0.18, 1.0,
+                ),
+            )
+        elif straight_exit:
+            brake = 0.0
+            throttle = clamp(max(throttle, 0.42), 0.0, 0.58)
+        elif recovering_from_runoff:
+            brake = 0.0
+            throttle = clamp(max(throttle, 0.62), 0.0, 0.72)
+        elif self.in_pitlane:
+            brake = 0.0
+            throttle = max(throttle, 0.34)
+        else:
+            brake = 0.0
+            throttle = clamp(max(throttle, 0.34), 0.0, 0.55)
+
+        if straight_exit:
+            # Hold the pit-exit tangent for exactly half a second before
+            # searching for and blending toward the circuit centreline.
+            steer = 0.0
+        elif target is not None:
+            desired = Vector2(target) - self.position
+            if desired.length_squared() <= 1e-9 and self.in_pitlane:
+                desired = (
+                    track.pitlane_centerline[-1]
+                    - track.pitlane_centerline[-2]
+                )
+            if desired.length_squared():
+                desired = desired.normalize()
+                heading = Vector2(1, 0).rotate(self.angle)
+                steering_error = math.atan2(
+                    heading.cross(desired), heading.dot(desired)
+                ) / math.pi
+                steer = clamp(
+                    steering_error * (
+                        3.45 if recovering_from_runoff else
+                        2.75 if (
+                            self.in_pitlane
+                            or self.pit_exit_guidance_frames > 0.0
+                        ) else 2.35
+                    )
+                    - self.angular_velocity * 0.10,
+                    -1.0, 1.0,
+                )
+        return steer, throttle, brake
+
     def update(self, track, dt=1.0, rain=0.0, damage_enabled=True):
         if not self.alive:
             return
         if self.pit_timer > 0:
             self.pit_timer -= dt
             self.overtake_active = False
+            self.drs_active = False
             self.brake_input = 0.0
             self.steering_input = 0.0
             self.throttle_input = 0.0
@@ -1425,12 +2000,22 @@ class Car:
         self.car_collision = False
         (
             steer, throttle, brake, overtake_request,
-            pit_request, pit_tyre,
+            recharge_request, pit_request, pit_tyre,
         ) = self.brain.think(controller_inputs)
         steer = clamp(steer, -1.0, 1.0)
         throttle = clamp(throttle, 0.0, 1.0)
         previous_angle = self.angle
-        self.pit_requested = pit_request >= 0.5
+        pit_available = bool(track.pit_box_positions())
+        emergency_pit = pit_available and (
+            self.tyre_wear >= 90.0 or self.puncture
+        )
+        # A request is a commitment and remains active until service. This
+        # prevents a controller's noisy threshold from cancelling pit entry.
+        self.pit_requested = bool(
+            self.pit_requested
+            or (pit_available and pit_request >= 0.5)
+            or emergency_pit
+        )
         self.requested_tyre = int(clamp(pit_tyre, 0, 3))
         self.brake_input = clamp(brake, 0.0, 1.0)
         self.steering_input = steer
@@ -1439,8 +2024,33 @@ class Car:
         heading_error = sensor_values[5]
         forward = Vector2(1, 0).rotate(self.angle)
         normal = Vector2(-forward.y, forward.x)
+        pit_transition = bool(
+            self.pit_entry_committed or self.in_pitlane
+            or self.pit_exit_straight_frames > 0.0
+            or self.pit_exit_guidance_frames > 0.0
+        )
+
+        def wheel_surface_at(position):
+            surface_name = track.surface(position)
+            if not pit_transition:
+                return surface_name
+            pit_distance = track.pitlane_nearest(position)[0]
+            if pit_distance <= PITLANE_WIDTH_M / 2 + 1.25:
+                return "pitlane"
+            if (
+                surface_name == "wall"
+                and pit_distance
+                <= PITLANE_WIDTH_M / 2 + CAR_LENGTH_M
+            ):
+                # The paved entry/exit merge is the union between the main
+                # road and pit road. Never wall-snap a partially merged car.
+                return "grass"
+            return surface_name
+
         wheel_surfaces = [
-            track.surface(self.position + forward * longitudinal + normal * lateral)
+            wheel_surface_at(
+                self.position + forward * longitudinal + normal * lateral
+            )
             for longitudinal in (-CAR_WHEELBASE_M / 2, CAR_WHEELBASE_M / 2)
             for lateral in (-CAR_WIDTH_M / 2, CAR_WIDTH_M / 2)
         ]
@@ -1467,32 +2077,80 @@ class Car:
         # Roughly 100 m/s at 60 FPS, expressed as metres per simulation frame.
         draft = clamp(self.slipstream, 0.0, 1.0)
         speed = self.velocity.length()
+        steer, throttle, brake = self.pit_guidance(
+            track, steer, throttle, self.brake_input
+        )
+        self.brake_input = clamp(brake, 0.0, 1.0)
+        self.steering_input = steer
+        self.throttle_input = throttle
         if self.fuel <= 0:
             throttle = 0.0
         is_hybrid = self.generation == "Hybrid"
+        self.recharge_active = bool(
+            is_hybrid
+            and recharge_request >= 0.5
+            and self.battery < 100.0
+        )
+        hybrid_drs_deployment = float(
+            is_hybrid and self.drs_eligible
+            and not self.recharge_active
+            and not self.in_pitlane and self.battery > 0.0
+        )
+        self.drs_active = bool(
+            hybrid_drs_deployment
+            or (
+                not is_hybrid and self.drs_eligible
+                and self.drs_in_zone and not self.in_pitlane
+            )
+        )
         self.overtake_active = bool(
             is_hybrid
+            and not self.recharge_active
             and overtake_request >= 0.5
             and self.battery > 0.0
             and throttle > 0.0
             and self.brake_input < 0.05
         )
         deployment = 1.0 if self.overtake_active else 0.0
-        # Hybrid output is an 80% combustion / 20% electric split. Scaling the
-        # complete power unit by 1.1875 makes the 80% combustion portion equal
-        # to the calibrated 95% wheel-power level, enough for 0–200 in 5.0 s.
-        power_ratio = (
-            HYBRID_TOTAL_POWER_SCALE
-            * (
-                HYBRID_COMBUSTION_SHARE
-                + HYBRID_ELECTRIC_SHARE * deployment
-            )
-            if is_hybrid else 1.0
+        electric_deployment = max(
+            deployment, hybrid_drs_deployment
         )
+        # Normal deployment is 80% combustion / 20% electric. DRS eligibility
+        # forces deployment and adds another 10% electric output (80/30).
+        if is_hybrid and self.recharge_active:
+            power_ratio = (
+                HYBRID_TOTAL_POWER_SCALE
+                * HYBRID_RECHARGE_COMBUSTION_SHARE
+            )
+        elif is_hybrid:
+            power_ratio = (
+                HYBRID_TOTAL_POWER_SCALE
+                * (
+                    HYBRID_COMBUSTION_SHARE
+                    + HYBRID_ELECTRIC_SHARE * electric_deployment
+                    + HYBRID_DRS_ELECTRIC_BONUS
+                    * hybrid_drs_deployment
+                )
+            )
+        else:
+            power_ratio = 1.0
         if is_hybrid:
-            speed_factor = clamp(speed / 1.35, 0.0, 1.0)
-            self.battery_regen = self.brake_input * speed_factor * 0.045 * dt
-            battery_drain = deployment * throttle * 0.08 * dt
+            # Strong MGU-K recovery: full-speed heavy braking can restore
+            # roughly 9.6 battery percentage points per second at 60 Hz.
+            # Speed scaling prevents stationary or near-stationary charging.
+            speed_factor = clamp(speed / 1.0, 0.0, 1.0)
+            self.battery_regen = (
+                self.brake_input ** 0.85
+                * speed_factor
+                * HYBRID_REGEN_RATE
+                * dt
+            )
+            if self.recharge_active:
+                self.battery_regen += HYBRID_RECHARGE_RATE * dt
+            battery_drain = (
+                electric_deployment * 0.08
+                + hybrid_drs_deployment * 0.04
+            ) * throttle * dt
             self.battery = clamp(
                 self.battery + self.battery_regen - battery_drain,
                 0.0, 100.0,
@@ -1501,9 +2159,16 @@ class Car:
             self.battery = 0.0
             self.battery_regen = 0.0
             self.overtake_active = False
-        hybrid_speed = 1.55 + 0.12 * deployment
+            self.recharge_active = False
+        hybrid_speed = (
+            1.48
+            if self.recharge_active else
+            1.55 + 0.12 * electric_deployment
+            + 0.06 * hybrid_drs_deployment
+        )
+        ice_speed = 1.72 if self.drs_active else 1.67
         max_speed = (
-            (hybrid_speed if is_hybrid else 1.67)
+            (hybrid_speed if is_hybrid else ice_speed)
             * (1 - self.fuel * 0.0015)
             * (1.0 + draft * 0.075)
         )
@@ -1608,7 +2273,11 @@ class Car:
             * dt,
         )
         if current_speed > 1e-9 and cornering_scrub > 0:
-            self.velocity.scale_to_length(current_speed - cornering_scrub)
+            remaining_speed = current_speed - cornering_scrub
+            if remaining_speed <= 1e-9:
+                self.velocity.update(0.0, 0.0)
+            else:
+                self.velocity.scale_to_length(remaining_speed)
 
         # Rolling resistance plus quadratic aerodynamic drag means a small
         # maintenance throttle is no longer enough to hold maximum speed.
@@ -1618,15 +2287,33 @@ class Car:
             (
                 ROLLING_RESISTANCE
                 + current_speed ** 2 * AERO_DRAG_COEFFICIENT
+                * (
+                    ICE_DRS_DRAG_MULTIPLIER
+                    if (
+                        self.generation == "ICE"
+                        and self.drs_active
+                    )
+                    else 1.0
+                )
             ) * dt,
         )
         if current_speed > 1e-9 and coast_drag > 0:
-            self.velocity.scale_to_length(current_speed - coast_drag)
+            remaining_speed = current_speed - coast_drag
+            if remaining_speed <= 1e-9:
+                self.velocity.update(0.0, 0.0)
+            else:
+                self.velocity.scale_to_length(remaining_speed)
         if self.velocity.length() > max_speed:
             self.velocity.scale_to_length(max_speed)
         if "grass" in wheel_surfaces:
-            self.dirty = 180
-            self.velocity *= 0.975 ** dt
+            if pit_transition:
+                # Keep enough momentum for the committed pit guidance to pull
+                # the car back onto the paved merge instead of beaching it.
+                self.dirty = max(self.dirty, 60)
+                self.velocity *= 0.992 ** dt
+            else:
+                self.dirty = 180
+                self.velocity *= 0.975 ** dt
         all_out = all(
             value not in ("asphalt", "kerb", "pitlane")
             for value in wheel_surfaces
@@ -1636,7 +2323,16 @@ class Car:
         if all_out and not self.outside_limits:
             self.track_limits += 1
         self.outside_limits = all_out
-        if surface == "wall":
+        pit_recovery = (
+            pit_transition
+            and track.pitlane_nearest(self.position)[0]
+            <= PITLANE_WIDTH_M / 2 + CAR_LENGTH_M * 1.5
+        )
+        if surface == "wall" and pit_recovery:
+            # Preserve position continuity while the committed guidance steers
+            # the car back into the merge corridor.
+            self.velocity *= 0.72
+        elif surface == "wall":
             impact = speed
             if damage_enabled:
                 self.health -= impact * 7.0
@@ -1658,6 +2354,7 @@ class Car:
                 self.position = (
                     near + direction.normalize() * safe_distance
                 )
+        previous_position = self.position.copy()
         self.position += self.velocity * dt
         self.in_pitlane = track.is_in_pitlane(self.position)
         if (
@@ -1697,7 +2394,7 @@ class Car:
         if self.tyre_wear > 70 and random.random() < ((self.tyre_wear - 70) / 30) ** 4 * .0005:
             self.puncture = True
         pit_boxes = track.pit_box_positions()
-        if self.pit_requested and pit_boxes:
+        if self.pit_requested and self.in_pitlane and pit_boxes:
             assigned = self.pit_box_index if self.pit_box_index is not None else 0
             box_position = pit_boxes[assigned % len(pit_boxes)]
             if self.position.distance_to(box_position) < 6:
@@ -1711,15 +2408,40 @@ class Car:
         )
         if self.previous_progress_m is None:
             self.previous_progress_m = progress_m
-        progress_delta_m = (
+        raw_progress_delta_m = (
             progress_m - self.previous_progress_m + track.measured_length_m / 2
         ) % track.measured_length_m - track.measured_length_m / 2
-        # Nearest-line queries can jump at crossings or close parallel sections.
-        # A real car cannot advance more than this in one simulation frame.
-        maximum_progress = 3.0 * max(dt, 0.25)
-        progress_delta_m = clamp(
-            progress_delta_m, -maximum_progress, maximum_progress
-        )
+        movement = self.position - previous_position
+        physical_step_m = movement.length()
+        maximum_progress = max(0.05, physical_step_m * 1.5)
+        # At crossings and close parallel sections, the global nearest-line
+        # query can jump to a distant part of the lap. Reject impossible
+        # topology jumps and fall back to actual forward vehicle movement.
+        if abs(raw_progress_delta_m) > maximum_progress:
+            progress_delta_m = clamp(
+                movement.dot(forward),
+                -physical_step_m, physical_step_m,
+            )
+        else:
+            progress_delta_m = raw_progress_delta_m
+        if self.race_distance_m is None:
+            start_segment = (
+                int(track.features.get("start_finish", 0))
+                % len(track.points)
+            ) * track.samples_per_section
+            start_progress_m = track.cumulative_lengths_m[start_segment]
+            relative_progress_m = (
+                progress_m - start_progress_m
+            ) % track.measured_length_m
+            if self.lap == 0 and relative_progress_m > (
+                track.measured_length_m / 2
+            ):
+                relative_progress_m -= track.measured_length_m
+            self.race_distance_m = (
+                self.lap * track.measured_length_m
+                + relative_progress_m
+            )
+        self.race_distance_m += progress_delta_m
         self.forward_distance_m += max(0.0, progress_delta_m)
         self.reverse_distance_m += max(0.0, -progress_delta_m)
         self.previous_progress_m = progress_m
@@ -1735,29 +2457,67 @@ class Car:
                 return self.previous_progress < marker <= progress
             return marker > self.previous_progress or marker <= progress
 
+        def crossed_feature(feature):
+            marker = track.features.get(feature)
+            return (
+                marker is not None
+                and crossed(
+                    (int(marker) % len(track.points))
+                    * track.samples_per_section
+                )
+            )
+
+        if crossed_feature("drs_detection"):
+            self.drs_eligible = (
+                self.drs_gap_seconds < DRS_MAX_GAP_SECONDS
+            )
+            if not self.drs_eligible:
+                self.drs_active = False
+        if crossed_feature("drs_entry"):
+            self.drs_in_zone = True
+        if crossed_feature("drs_exit"):
+            self.drs_in_zone = False
+            if self.generation == "ICE":
+                self.drs_active = False
+
+        start_marker = (
+            int(track.features.get("start_finish", 0)) % len(track.points)
+        ) * track.samples_per_section
         sectors = [
             (int(index) % len(track.points)) * track.samples_per_section
             for index in track.features.get("sectors", [])
         ]
+        sectors.sort(
+            key=lambda marker: (
+                marker - start_marker
+            ) % len(track.centerline)
+        )
         if self.checkpoint < len(sectors) and crossed(sectors[self.checkpoint]):
             self.checkpoint += 1
-        start_marker = (
-            int(track.features.get("start_finish", 0)) % len(track.points)
-        ) * track.samples_per_section
-        if crossed(start_marker) and speed > 1 and (not sectors or self.checkpoint >= len(sectors)):
+        crossed_main_finish = track.crossed_timing_line(
+            previous_position, self.position
+        )
+        crossed_pit_finish = (
+            self.in_pitlane
+            and track.crossed_timing_line(
+                previous_position, self.position, pitlane=True
+            )
+        )
+        if (
+            (crossed_main_finish or crossed_pit_finish)
+            and (not sectors or self.checkpoint >= len(sectors))
+        ):
             self.lap += 1
             self.tyre_laps += 1
             self.checkpoint = 0
+            self.race_distance_m = max(
+                self.race_distance_m,
+                self.lap * track.measured_length_m,
+            )
         self.previous_progress = progress
-        lap_progress_m = progress_m
-        if self.lap == 0 and progress_m > track.measured_length_m * 0.8:
-            # Cars in the rows behind the line begin a few metres before zero.
-            lap_progress_m -= track.measured_length_m
-        self.score = (
-            self.lap * track.measured_length_m
-            + lap_progress_m
-            - self.track_limits * 10.0
-        )
+        # Running order is physical distance only. Penalties still affect
+        # training fitness, but cannot make the timetable jump positions.
+        self.score = self.race_distance_m
         stalled_penalty = min(
             max(0.0, self.stagnant_frames - 180.0) * 0.025, 100.0
         )
@@ -2137,13 +2897,24 @@ class Car:
 def spawn_car(
     track, brain, color, name="AI", offset=0, wide_start=False
 ):
-    # Racecraft training uses one staggered car per longitudinal slot so a
-    # large population is already separated before its first decision.
-    row = offset if wide_start else offset // 2
-    longitudinal_gap = 4.0 if wide_start else 2.0
-    target_distance = row * (CAR_LENGTH_M + longitudinal_gap)
-    current_index = 0
-    current = track.centerline[0]
+    # Race grids use two staggered columns. P2 is beside but slightly behind
+    # P1; P3 occupies the next slot directly behind P1.
+    if wide_start:
+        row = offset
+        target_distance = row * (CAR_LENGTH_M + 4.0)
+    else:
+        row = offset // 2
+        column = offset % 2
+        row_spacing = CAR_LENGTH_M + 2.4
+        column_stagger = 2.8
+        target_distance = (
+            row * row_spacing + column * column_stagger
+        )
+    start_control = (
+        int(track.features.get("start_finish", 0)) % len(track.points)
+    )
+    current_index = start_control * track.samples_per_section
+    current = track.centerline[current_index]
     remaining = target_distance
     tangent = (track.centerline[1] - current).normalize()
     start = current
@@ -2160,7 +2931,18 @@ def spawn_car(
         current_index = previous_index
         current = previous
     normal = Vector2(-tangent.y, tangent.x)
-    grid_half_width = CAR_WIDTH_M / 2 + (.75 if wide_start else .45)
+    grid_half_width = (
+        CAR_WIDTH_M / 2 + .75
+        if wide_start
+        else clamp(
+            track.road_width_m * .20,
+            CAR_WIDTH_M / 2 + .55,
+            max(
+                CAR_WIDTH_M / 2 + .55,
+                track.road_width_m / 2 - CAR_WIDTH_M / 2 - .75,
+            ),
+        )
+    )
     position = start + normal * (-grid_half_width if offset % 2 else grid_half_width)
     car = Car(
         position.copy(), tangent.angle_to(Vector2(1, 0)) * -1,
@@ -2168,6 +2950,16 @@ def spawn_car(
     )
     car.previous_progress = track.progress(car.position)
     car.previous_progress_m = track.progress_metres(car.position)
+    start_progress_m = track.cumulative_lengths_m[
+        start_control * track.samples_per_section
+    ]
+    relative_progress_m = (
+        car.previous_progress_m - start_progress_m
+    ) % track.measured_length_m
+    if relative_progress_m > track.measured_length_m / 2:
+        relative_progress_m -= track.measured_length_m
+    car.race_distance_m = relative_progress_m
+    car.score = relative_progress_m
     return car
 
 
@@ -2244,14 +3036,19 @@ class Button:
 class Game:
     def __init__(self):
         pygame.init()
-        try:
-            pygame.scrap.init()
-        except pygame.error:
-            pass
         pygame.display.set_caption("Formula AI Lab")
         self.display_flags = pygame.RESIZABLE | pygame.DOUBLEBUF
+        display_info = pygame.display.Info()
+        initial_window_size = (
+            min(DISPLAY_WIDTH, display_info.current_w),
+            min(
+                DISPLAY_HEIGHT,
+                display_info.current_h,
+                max(HEIGHT, round(display_info.current_h * 0.85)),
+            ),
+        )
         self.window = pygame.display.set_mode(
-            (DISPLAY_WIDTH, DISPLAY_HEIGHT), self.display_flags
+            initial_window_size, self.display_flags
         )
         self.screen = pygame.Surface((WIDTH, HEIGHT)).convert()
         self._ui_background = None
@@ -2304,9 +3101,15 @@ class Game:
         self.target_laps = 3
         self.editor_points = []
         self.editor_widths = []
+        self.editor_grass_widths = []
         self.editor_pitlane_points = []
+        self.editor_pitlane_widths = []
+        self.editor_pitlane_grass_widths = []
         self.editor_width_node = None
         self.editor_width_dragging = False
+        self.editor_selected_kind = None
+        self.editor_selected_index = None
+        self.editor_node_dragging = False
         self.editor_kerbs = set()
         self.editor_manual_kerbs = False
         self.editor_features = {}
@@ -2436,10 +3239,8 @@ class Game:
         if self._present_size != viewport_size:
             self._present_surface = pygame.Surface(viewport_size).convert()
             self._present_size = viewport_size
-        pygame.transform.smoothscale(
-            self.screen,
-            viewport_size,
-            self._present_surface,
+        pygame.transform.scale(
+            self.screen, viewport_size, self._present_surface
         )
         self.window.blit(self._present_surface, self.viewport_rect)
         pygame.display.flip()
@@ -3281,7 +4082,7 @@ class Game:
 
     def start_user_training(self):
         try:
-            program = SafeAlgorithm(self.algorithm_source)
+            program = Brain.compile_source(self.algorithm_source)
             self.algorithm_sources[self.training_generation] = (
                 self.algorithm_source
             )
@@ -3453,8 +4254,10 @@ class Game:
             car.fuel = entry["fuel"]
             car.generation = self.race_settings["generation"]
             car.battery = 100.0 if car.generation == "Hybrid" else 0.0
+            car.starting_position = i + 1
             car.team = self.team_names[i // 2] if self.race_settings["teams"] else ""
             car.pit_box_index = i // 2 if self.race_settings["teams"] else i
+            car.timing_history = [(car.score, 0.0)]
             self.cars.append(car)
         for i, car in enumerate(self.cars):
             car.previous_progress = self.track.progress(car.position)
@@ -3522,6 +4325,13 @@ class Game:
                     "generation": car.generation,
                     "battery": round(car.battery, 2),
                     "overtake": car.overtake_active,
+                    "recharge": car.recharge_active,
+                    "drs_eligible": car.drs_eligible,
+                    "drs_active": car.drs_active,
+                    "drs_gap_seconds": (
+                        round(car.drs_gap_seconds, 3)
+                        if math.isfinite(car.drs_gap_seconds) else None
+                    ),
                     "brake": round(car.brake_input, 3),
                     "aggression": round(car.race_aggression, 3),
                     "aggression_error": round(car.aggression_error, 3),
@@ -3529,6 +4339,11 @@ class Game:
                     "gear": car.gear,
                     "rpm": round(car.rpm),
                     "health": round(car.health, 2), "pitstops": car.pitstops,
+                    "starting_position": car.starting_position,
+                    "finish_time": car.finish_time,
+                    "retirement_time": car.retirement_time,
+                    "retirement_reason": car.retirement_reason,
+                    "removed_from_track": car.removed_from_track,
                     "team": car.team, "brain": car.brain_name,
                 }
                 for car in self.cars
@@ -3625,11 +4440,23 @@ class Game:
             if target == 0:
                 self.editor_points = [p.copy() for p in self.track.points]
                 self.editor_widths = list(self.track.road_widths_m)
+                self.editor_grass_widths = list(
+                    self.track.grass_widths_m
+                )
                 self.editor_pitlane_points = [
                     point.copy() for point in self.track.pitlane_points
                 ]
+                self.editor_pitlane_widths = list(
+                    self.track.pitlane_road_widths_m
+                )
+                self.editor_pitlane_grass_widths = list(
+                    self.track.pitlane_grass_widths_m
+                )
                 self.editor_width_node = None
                 self.editor_width_dragging = False
+                self.editor_selected_kind = None
+                self.editor_selected_index = None
+                self.editor_node_dragging = False
                 self.editor_kerbs = set(self.track.kerb_points)
                 self.editor_manual_kerbs = False
                 self.editor_features = json.loads(json.dumps(self.track.features))
@@ -3676,7 +4503,9 @@ class Game:
             ("puncture, rain, slipstream, lap/progress", WHITE),
         ]
         if self.training_generation == "Hybrid":
-            docs.append(("battery/regen/overtake (80% + 20%)", YELLOW))
+            docs.append((
+                "battery/regen/overtake/recharge_active", YELLOW
+            ))
         else:
             docs.append(("ICE: constant 100% power", YELLOW))
         docs.extend([
@@ -3686,6 +4515,10 @@ class Game:
         ])
         if self.training_generation == "Hybrid":
             docs.append(("overtake: 0 off / 1 deploy", WHITE))
+            docs.append((
+                "recharge: 0 off / 1 charge; 70% ICE, +3.5%/s",
+                WHITE,
+            ))
         docs.extend([
             ("pit_request: 0 no / 1 yes", WHITE),
             ("pit_tyre: 0 S / 1 M / 2 H / 3 W", WHITE),
@@ -3792,7 +4625,7 @@ class Game:
                     self.start_user_training()
                 elif command and event.key == pygame.K_s:
                     try:
-                        SafeAlgorithm(self.algorithm_source)
+                        Brain.compile_source(self.algorithm_source)
                         self.algorithm_error = ""
                         self.open_name_dialog(
                             "algorithm", "Save AI controller",
@@ -4119,6 +4952,9 @@ class Game:
             self.editor_geometry, self.editor_declared_length, self.editor_road_width,
             self.editor_widths,
             [point.copy() for point in self.editor_pitlane_points],
+            self.editor_grass_widths,
+            self.editor_pitlane_widths,
+            self.editor_pitlane_grass_widths,
         )
 
     def editor_node_at(self, screen_position, radius=16):
@@ -4177,7 +5013,77 @@ class Game:
         if not self.editor_pitlane_ready():
             return False
         self.editor_pitlane_points.append(Vector2(world_position))
+        self.editor_pitlane_widths.append(PITLANE_WIDTH_M)
+        self.editor_pitlane_grass_widths.append(
+            max(PITLANE_WIDTH_M + 2.0, 16.0)
+        )
         return True
+
+    def select_editor_node(self, screen_position):
+        """Select the closest main or pit node under a right click."""
+        route = self.editor_node_at(screen_position)
+        pit = self.editor_pitlane_node_at(screen_position)
+        if route is None and pit is None:
+            self.editor_selected_kind = None
+            self.editor_selected_index = None
+            self.editor_width_node = None
+            return False
+        choose_pit = pit is not None
+        if route is not None and pit is not None:
+            click = Vector2(screen_position)
+            route_screen = (
+                self.editor_points[route] - self.editor_camera
+            ) * self.editor_zoom
+            pit_screen = (
+                self.editor_pitlane_points[pit] - self.editor_camera
+            ) * self.editor_zoom
+            choose_pit = (
+                pit_screen.distance_squared_to(click)
+                <= route_screen.distance_squared_to(click)
+            )
+        self.editor_selected_kind = "pit" if choose_pit else "route"
+        self.editor_selected_index = pit if choose_pit else route
+        self.editor_width_node = None if choose_pit else route
+        return True
+
+    def adjust_selected_editor_width(self, width_kind, delta):
+        """Adjust road or surrounding-grass width on the selected node."""
+        index = self.editor_selected_index
+        if index is None:
+            self.notice("Right-click a route or pit-road node first")
+            return
+        if self.editor_selected_kind == "pit":
+            if not 0 <= index < len(self.editor_pitlane_points):
+                return
+            if width_kind == "road":
+                self.editor_pitlane_widths[index] = clamp(
+                    self.editor_pitlane_widths[index] + delta, 4.0, 18.0
+                )
+                self.editor_pitlane_grass_widths[index] = max(
+                    self.editor_pitlane_grass_widths[index],
+                    self.editor_pitlane_widths[index] + 2.0,
+                )
+            else:
+                self.editor_pitlane_grass_widths[index] = clamp(
+                    self.editor_pitlane_grass_widths[index] + delta,
+                    max(self.editor_pitlane_widths[index] + 2.0, 8.0),
+                    60.0,
+                )
+        elif self.editor_selected_kind == "route":
+            if not 0 <= index < len(self.editor_points):
+                return
+            if width_kind == "road":
+                self.adjust_editor_node_width(index, delta)
+                self.editor_grass_widths[index] = max(
+                    self.editor_grass_widths[index],
+                    self.editor_widths[index] + 4.0,
+                )
+            else:
+                self.editor_grass_widths[index] = clamp(
+                    self.editor_grass_widths[index] + delta,
+                    max(self.editor_widths[index] + 4.0, 16.0), 80.0,
+                )
+        self.editor_declared_length = None
 
     def toggle_editor_pit_box(self, pitlane_index):
         if not 0 <= pitlane_index < len(self.editor_pitlane_points):
@@ -4204,12 +5110,128 @@ class Game:
             clamp(width + delta, 6.0, 24.0)
             for width in self.editor_widths
         ]
+        self.editor_grass_widths = [
+            max(grass_width, road_width + 4.0)
+            for grass_width, road_width in zip(
+                self.editor_grass_widths, self.editor_widths
+            )
+        ]
         if self.editor_widths:
             self.editor_road_width = sum(self.editor_widths) / len(self.editor_widths)
         else:
             self.editor_road_width = clamp(
                 self.editor_road_width + delta, 6.0, 24.0
             )
+
+    def adjust_all_editor_grass_widths(self, delta):
+        self.editor_grass_widths = [
+            clamp(
+                width + delta,
+                max(self.editor_widths[index] + 4.0, 16.0), 80.0,
+            )
+            for index, width in enumerate(self.editor_grass_widths)
+        ]
+        current = float(
+            self.editor_features.get("border_margin", BORDER_W)
+        )
+        self.editor_features["border_margin"] = clamp(
+            current + delta, 16.0, 80.0
+        )
+
+    def delete_editor_node(self, index):
+        """Delete a route node and shift every later node into its index."""
+        if not 0 <= index < len(self.editor_points):
+            return False
+        self.editor_points.pop(index)
+        if index < len(self.editor_widths):
+            self.editor_widths.pop(index)
+        if index < len(self.editor_grass_widths):
+            self.editor_grass_widths.pop(index)
+        point_count = len(self.editor_points)
+
+        self.editor_kerbs = {
+            kerb_index - 1 if kerb_index > index else kerb_index
+            for kerb_index in self.editor_kerbs
+            if kerb_index != index and kerb_index < point_count + 1
+        }
+        self.editor_features["sectors"] = [
+            sector_index - 1 if sector_index > index else sector_index
+            for sector_index in self.editor_features.get("sectors", [])
+            if sector_index != index and sector_index < point_count + 1
+        ]
+        for feature in (
+            "start_finish", "pit_entry", "pit_exit",
+            "drs_detection", "drs_entry", "drs_exit",
+        ):
+            feature_index = self.editor_features.get(feature)
+            if feature_index is None:
+                continue
+            if not point_count:
+                self.editor_features[feature] = (
+                    0 if feature == "start_finish" else None
+                )
+            elif feature_index > index:
+                self.editor_features[feature] = feature_index - 1
+            elif feature_index == index:
+                # The following node now owns the deleted node's position.
+                self.editor_features[feature] = min(index, point_count - 1)
+
+        self.editor_width_node = None
+        self.editor_width_dragging = False
+        if self.editor_selected_kind == "route":
+            self.editor_selected_kind = None
+            self.editor_selected_index = None
+            self.editor_node_dragging = False
+        self.editor_declared_length = None
+        if (
+            not self.editor_manual_kerbs
+            and len(self.editor_points) >= 3
+        ):
+            self.editor_kerbs = Track(
+                self.editor_points, geometry=self.editor_geometry,
+                road_widths_m=self.editor_widths,
+                grass_widths_m=self.editor_grass_widths,
+            ).kerb_points
+        if not self.editor_pitlane_ready():
+            self.editor_pitlane_points.clear()
+            self.editor_pitlane_widths.clear()
+            self.editor_pitlane_grass_widths.clear()
+            self.editor_features["pit_boxes"] = []
+            self.editor_features["pit_start_finish"] = None
+        return True
+
+    def delete_editor_pitlane_node(self, index):
+        """Delete a pit-road node and reindex its timing and box markers."""
+        if not 0 <= index < len(self.editor_pitlane_points):
+            return False
+        self.editor_pitlane_points.pop(index)
+        if index < len(self.editor_pitlane_widths):
+            self.editor_pitlane_widths.pop(index)
+        if index < len(self.editor_pitlane_grass_widths):
+            self.editor_pitlane_grass_widths.pop(index)
+        point_count = len(self.editor_pitlane_points)
+        self.editor_features["pit_boxes"] = [
+            box_index - 1 if box_index > index else box_index
+            for box_index in self.editor_features.get("pit_boxes", [])
+            if box_index != index
+            and box_index < point_count + 1
+        ]
+        finish_index = self.editor_features.get("pit_start_finish")
+        if finish_index is not None:
+            if not point_count:
+                self.editor_features["pit_start_finish"] = None
+            elif finish_index > index:
+                self.editor_features["pit_start_finish"] = finish_index - 1
+            elif finish_index == index:
+                self.editor_features["pit_start_finish"] = min(
+                    index, point_count - 1
+                )
+        self.editor_declared_length = None
+        if self.editor_selected_kind == "pit":
+            self.editor_selected_kind = None
+            self.editor_selected_index = None
+            self.editor_node_dragging = False
+        return True
 
     def editor(self, events):
         tools = [
@@ -4222,10 +5244,21 @@ class Game:
         tool_rects = {}
         for i, (key, _) in enumerate(tools):
             tool_rects[key] = pygame.Rect(x + (i % 2) * 122, 190 + (i // 2) * 46, 114, 37)
-        minus_border = pygame.Rect(x + 145, 405, 38, 32)
-        plus_border = pygame.Rect(x + 198, 405, 38, 32)
-        minus_road = pygame.Rect(x + 145, 459, 38, 32)
-        plus_road = pygame.Rect(x + 198, 459, 38, 32)
+        pit_finish_rect = pygame.Rect(x + 104, 163, 64, 24)
+        delete_rect = pygame.Rect(x + 172, 163, 64, 24)
+        drs_tool_rects = {
+            "drs_detection": pygame.Rect(x, 371, 76, 28),
+            "drs_entry": pygame.Rect(x + 81, 371, 76, 28),
+            "drs_exit": pygame.Rect(x + 162, 371, 76, 28),
+        }
+        minus_border = pygame.Rect(x + 145, 426, 38, 30)
+        plus_border = pygame.Rect(x + 198, 426, 38, 30)
+        minus_road = pygame.Rect(x + 145, 478, 38, 30)
+        plus_road = pygame.Rect(x + 198, 478, 38, 30)
+        selected_road_minus = pygame.Rect(x + 148, 536, 32, 26)
+        selected_road_plus = pygame.Rect(x + 198, 536, 32, 26)
+        selected_grass_minus = pygame.Rect(x + 148, 574, 32, 26)
+        selected_grass_plus = pygame.Rect(x + 198, 574, 32, 26)
 
         for event in events:
             if (
@@ -4242,12 +5275,71 @@ class Game:
                 else:
                     cursor = Vector2(self.logical_mouse_position())
                     world_at_cursor = self.editor_camera + cursor / self.editor_zoom
-                    self.editor_zoom = clamp(self.editor_zoom * (1.15 ** event.y), .28, 2.5)
+                    self.editor_zoom = clamp(
+                        self.editor_zoom * (1.20 ** event.y), .28, 6.0
+                    )
                     self.editor_camera = world_at_cursor - cursor / self.editor_zoom
+            elif (
+                event.type == pygame.MOUSEMOTION
+                and event.buttons[2]
+                and self.editor_node_dragging
+                and event.pos[0] < CANVAS_W
+            ):
+                world = (
+                    self.editor_camera
+                    + Vector2(event.pos) / self.editor_zoom
+                )
+                index = self.editor_selected_index
+                if self.editor_selected_kind == "route" and (
+                    index is not None
+                    and 0 <= index < len(self.editor_points)
+                ):
+                    self.editor_points[index] = world
+                    self.editor_declared_length = None
+                elif self.editor_selected_kind == "pit" and (
+                    index is not None
+                    and 0 <= index < len(self.editor_pitlane_points)
+                ):
+                    self.editor_pitlane_points[index] = world
+                    self.editor_declared_length = None
             elif event.type == pygame.MOUSEMOTION and event.buttons[1] and event.pos[0] < CANVAS_W:
                 self.editor_camera -= Vector2(event.rel) / self.editor_zoom
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                if event.pos[0] < CANVAS_W:
+                    self.editor_node_dragging = self.select_editor_node(
+                        event.pos
+                    )
+                    if self.editor_node_dragging:
+                        kind = (
+                            "P" if self.editor_selected_kind == "pit"
+                            else ""
+                        )
+                        self.notice(
+                            f"Selected {kind}{self.editor_selected_index + 1}"
+                            " • drag to move"
+                        )
+                continue
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 selected = next((key for key, rect in tool_rects.items() if rect.collidepoint(event.pos)), None)
+                selected_drs = next(
+                    (
+                        key for key, rect in drs_tool_rects.items()
+                        if rect.collidepoint(event.pos)
+                    ),
+                    None,
+                )
+                if selected_drs:
+                    self.editor_tool = selected_drs
+                    continue
+                if pit_finish_rect.collidepoint(event.pos):
+                    if self.editor_pitlane_points:
+                        self.editor_tool = "pit_finish"
+                    else:
+                        self.notice("Add at least one PIT ROAD node first")
+                    continue
+                if delete_rect.collidepoint(event.pos):
+                    self.editor_tool = "delete"
+                    continue
                 if selected:
                     if selected == "pitlane" and not self.editor_pitlane_ready():
                         self.notice("Place PIT IN and PIT OUT before the pit road")
@@ -4258,10 +5350,10 @@ class Game:
                     self.editor_tool = selected
                     continue
                 if minus_border.collidepoint(event.pos):
-                    self.editor_features["border_margin"] = max(16, self.editor_features.get("border_margin", BORDER_W) - 2)
+                    self.adjust_all_editor_grass_widths(-2.0)
                     continue
                 if plus_border.collidepoint(event.pos):
-                    self.editor_features["border_margin"] = min(80, self.editor_features.get("border_margin", BORDER_W) + 2)
+                    self.adjust_all_editor_grass_widths(2.0)
                     continue
                 if minus_road.collidepoint(event.pos):
                     self.adjust_all_editor_widths(-0.5)
@@ -4269,8 +5361,69 @@ class Game:
                 if plus_road.collidepoint(event.pos):
                     self.adjust_all_editor_widths(0.5)
                     continue
+                if selected_road_minus.collidepoint(event.pos):
+                    self.adjust_selected_editor_width("road", -0.5)
+                    continue
+                if selected_road_plus.collidepoint(event.pos):
+                    self.adjust_selected_editor_width("road", 0.5)
+                    continue
+                if selected_grass_minus.collidepoint(event.pos):
+                    self.adjust_selected_editor_width("grass", -1.0)
+                    continue
+                if selected_grass_plus.collidepoint(event.pos):
+                    self.adjust_selected_editor_width("grass", 1.0)
+                    continue
                 if event.pos[0] < CANVAS_W:
                     world = self.editor_camera + Vector2(event.pos) / self.editor_zoom
+                    if self.editor_tool == "delete":
+                        nearest_route = self.editor_node_at(event.pos)
+                        nearest_pit = self.editor_pitlane_node_at(event.pos)
+                        if nearest_route is None and nearest_pit is None:
+                            self.notice("Select a route or pit-road node to delete")
+                            continue
+                        delete_pit = nearest_pit is not None
+                        if nearest_route is not None and nearest_pit is not None:
+                            route_screen = (
+                                self.editor_points[nearest_route]
+                                - self.editor_camera
+                            ) * self.editor_zoom
+                            pit_screen = (
+                                self.editor_pitlane_points[nearest_pit]
+                                - self.editor_camera
+                            ) * self.editor_zoom
+                            click = Vector2(event.pos)
+                            delete_pit = (
+                                pit_screen.distance_squared_to(click)
+                                <= route_screen.distance_squared_to(click)
+                            )
+                        if delete_pit:
+                            deleted_number = nearest_pit + 1
+                            self.delete_editor_pitlane_node(nearest_pit)
+                            self.notice(
+                                f"Deleted pit-road node P{deleted_number}; "
+                                "later pit nodes shifted"
+                            )
+                        else:
+                            deleted_number = nearest_route + 1
+                            self.delete_editor_node(nearest_route)
+                            self.notice(
+                                f"Deleted node {deleted_number}; later nodes shifted"
+                            )
+                        continue
+                    if self.editor_tool == "pit_finish":
+                        nearest_pit = self.editor_pitlane_node_at(event.pos)
+                        if nearest_pit is None:
+                            self.notice(
+                                "Pit timing line must be placed on a PIT ROAD node"
+                            )
+                        else:
+                            self.editor_features["pit_start_finish"] = (
+                                nearest_pit
+                            )
+                            self.notice(
+                                f"Pit timing line set at P{nearest_pit + 1}"
+                            )
+                        continue
                     if self.editor_tool == "pitlane":
                         self.editor_width_node = None
                         self.editor_width_dragging = False
@@ -4313,12 +5466,21 @@ class Game:
                         if nearest is None:
                             self.editor_points.append(world)
                             self.editor_widths.append(self.editor_road_width)
+                            self.editor_grass_widths.append(
+                                max(
+                                    self.editor_road_width + 4.0,
+                                    float(self.editor_features.get(
+                                        "border_margin", BORDER_W
+                                    )),
+                                )
+                            )
                             self.editor_width_node = len(self.editor_points) - 1
                             self.editor_declared_length = None
                             if not self.editor_manual_kerbs and len(self.editor_points) >= 3:
                                 self.editor_kerbs = Track(
                                     self.editor_points, geometry=self.editor_geometry,
                                     road_widths_m=self.editor_widths,
+                                    grass_widths_m=self.editor_grass_widths,
                                 ).kerb_points
                     elif nearest is not None:
                         if self.editor_points[nearest].distance_to(world) <= 24 / self.editor_zoom:
@@ -4333,10 +5495,25 @@ class Game:
                                 sectors.remove(nearest) if nearest in sectors else sectors.append(nearest)
                             elif self.editor_tool == "start":
                                 self.editor_features["start_finish"] = nearest
-                            elif self.editor_tool in ("pit_entry", "pit_exit"):
+                            elif self.editor_tool in (
+                                "pit_entry", "pit_exit",
+                                "drs_detection", "drs_entry", "drs_exit",
+                            ):
                                 self.editor_features[self.editor_tool] = nearest
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 self.editor_width_dragging = False
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+                if (
+                    self.editor_node_dragging
+                    and not self.editor_manual_kerbs
+                    and len(self.editor_points) >= 3
+                ):
+                    self.editor_kerbs = Track(
+                        self.editor_points, geometry=self.editor_geometry,
+                        road_widths_m=self.editor_widths,
+                        grass_widths_m=self.editor_grass_widths,
+                    ).kerb_points
+                self.editor_node_dragging = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.mode = "menu"
@@ -4348,48 +5525,53 @@ class Game:
                         self.notice("Add at least one PIT ROAD node first")
                     else:
                         self.editor_tool = selected
+                elif event.key == pygame.K_9:
+                    self.editor_tool = "delete"
+                elif event.key == pygame.K_0:
+                    if self.editor_pitlane_points:
+                        self.editor_tool = "pit_finish"
+                    else:
+                        self.notice("Add at least one PIT ROAD node first")
+                elif (
+                    event.key == pygame.K_DELETE
+                    and self.editor_width_node is not None
+                ):
+                    deleted_number = self.editor_width_node + 1
+                    self.delete_editor_node(self.editor_width_node)
+                    self.notice(
+                        f"Deleted node {deleted_number}; later nodes shifted"
+                    )
                 elif event.key == pygame.K_BACKSPACE:
-                    if self.editor_tool in ("pitlane", "pit_box"):
+                    if self.editor_tool in (
+                        "pitlane", "pit_box", "pit_finish"
+                    ):
                         if self.editor_pitlane_points:
-                            removed = len(self.editor_pitlane_points) - 1
-                            self.editor_pitlane_points.pop()
-                            self.editor_features["pit_boxes"] = [
-                                index for index in
-                                self.editor_features.get("pit_boxes", [])
-                                if index != removed
-                                and index < len(self.editor_pitlane_points)
-                            ]
+                            self.delete_editor_pitlane_node(
+                                len(self.editor_pitlane_points) - 1
+                            )
                     elif self.editor_points:
-                        self.editor_points.pop()
-                        if self.editor_widths:
-                            self.editor_widths.pop()
-                        self.editor_width_node = None
-                        count = len(self.editor_points)
-                        self.editor_kerbs = {
-                            i for i in self.editor_kerbs if i < count
-                        }
-                        self.editor_features["sectors"] = [
-                            i for i in
-                            self.editor_features.get("sectors", [])
-                            if i < count
-                        ]
-                        for endpoint in ("pit_entry", "pit_exit"):
-                            index = self.editor_features.get(endpoint)
-                            if index is not None and index >= count:
-                                self.editor_features[endpoint] = None
-                        if not self.editor_pitlane_ready():
-                            self.editor_pitlane_points.clear()
-                            self.editor_features["pit_boxes"] = []
+                        self.delete_editor_node(
+                            len(self.editor_points) - 1
+                        )
                 elif event.key == pygame.K_c:
                     self.editor_points.clear()
                     self.editor_widths.clear()
+                    self.editor_grass_widths.clear()
                     self.editor_pitlane_points.clear()
+                    self.editor_pitlane_widths.clear()
+                    self.editor_pitlane_grass_widths.clear()
                     self.editor_width_node = None
                     self.editor_width_dragging = False
+                    self.editor_selected_kind = None
+                    self.editor_selected_index = None
+                    self.editor_node_dragging = False
                     self.editor_kerbs.clear()
                     self.editor_features = {
-                        "start_finish": 0, "sectors": [], "pit_entry": None,
-                        "pit_exit": None, "pit_boxes": [], "border_margin": BORDER_W,
+                        "start_finish": 0, "pit_start_finish": None,
+                        "sectors": [], "pit_entry": None, "pit_exit": None,
+                        "pit_boxes": [], "drs_detection": None,
+                        "drs_entry": None, "drs_exit": None,
+                        "border_margin": BORDER_W,
                     }
                     self.editor_manual_kerbs = False
                 elif event.key in (pygame.K_RETURN, pygame.K_s):
@@ -4407,6 +5589,31 @@ class Game:
                         and not self.editor_pitlane_points
                     ):
                         self.notice("Pit boxes require a PIT ROAD")
+                    elif (
+                        any(
+                            self.editor_features.get(feature) is not None
+                            for feature in (
+                                "drs_detection", "drs_entry", "drs_exit"
+                            )
+                        )
+                        and not all(
+                            self.editor_features.get(feature) is not None
+                            for feature in (
+                                "drs_detection", "drs_entry", "drs_exit"
+                            )
+                        )
+                    ):
+                        self.notice(
+                            "DRS requires DET, IN and OUT nodes"
+                        )
+                    elif (
+                        self.editor_features.get("drs_entry") is not None
+                        and self.editor_features.get("drs_entry")
+                        == self.editor_features.get("drs_exit")
+                    ):
+                        self.notice(
+                            "DRS IN and DRS OUT must use different nodes"
+                        )
                     elif event.key == pygame.K_s:
                         self.open_name_dialog(
                             "track", "Save track",
@@ -4416,6 +5623,16 @@ class Game:
                         self.track = self.fit_editor_track()
                         self.selected_track = None
                         self.mode = "menu"
+
+        editor_mouse = Vector2(self.logical_mouse_position())
+        mouse_on_editor = (
+            0 <= editor_mouse.x < CANVAS_W
+            and 0 <= editor_mouse.y < HEIGHT
+        )
+        mouse_world = (
+            self.editor_camera + editor_mouse / self.editor_zoom
+            if mouse_on_editor else None
+        )
 
         self.screen.fill((25, 76, 43))
         self.screen.set_clip(pygame.Rect(0, 0, CANVAS_W, HEIGHT))
@@ -4436,6 +5653,9 @@ class Game:
             self.editor_points, "Custom", self.editor_kerbs, self.editor_features,
             self.editor_geometry, self.editor_declared_length, self.editor_road_width,
             self.editor_widths, self.editor_pitlane_points,
+            self.editor_grass_widths,
+            self.editor_pitlane_widths,
+            self.editor_pitlane_grass_widths,
         ) if screen_points else None
         if temp and len(screen_points) >= 2:
             temp.draw(self.screen, -self.editor_camera * self.editor_zoom, self.editor_zoom)
@@ -4445,15 +5665,27 @@ class Game:
         ]
         for index, point in enumerate(pitlane_screen_points):
             is_box = index in self.editor_features.get("pit_boxes", [])
+            is_pit_finish = (
+                index == self.editor_features.get("pit_start_finish")
+            )
             pygame.draw.circle(
                 self.screen,
+                YELLOW if is_pit_finish else
                 (168, 85, 247) if is_box else (249, 115, 22),
-                point, 6 if is_box else 5,
+                point, 7 if is_pit_finish else 6 if is_box else 5,
             )
             pygame.draw.circle(self.screen, WHITE, point, 7, 1)
+            if (
+                self.editor_selected_kind == "pit"
+                and index == self.editor_selected_index
+            ):
+                pygame.draw.circle(
+                    self.screen, YELLOW, point, 12, 2
+                )
             self.text(
-                f"P{index + 1}", point + Vector2(7, -16),
-                "tiny", WHITE,
+                f"P{index + 1}{' LAP' if is_pit_finish else ''}",
+                point + Vector2(7, -16), "tiny",
+                YELLOW if is_pit_finish else WHITE,
             )
         if (
             self.editor_width_node is not None
@@ -4475,6 +5707,9 @@ class Game:
                 )
         feature_point_colors = {
             "pit_entry": (249, 115, 22), "pit_exit": (34, 197, 94),
+            "drs_detection": (255, 196, 61),
+            "drs_entry": (38, 211, 126),
+            "drs_exit": (239, 82, 92),
         }
         for i, point in enumerate(screen_points):
             point_color = YELLOW if i == self.editor_features.get("start_finish", 0) else (RED if i in self.editor_kerbs else CYAN)
@@ -4488,6 +5723,9 @@ class Game:
                 or i in self.editor_features.get("sectors", [])
                 or i == self.editor_features.get("pit_entry")
                 or i == self.editor_features.get("pit_exit")
+                or i == self.editor_features.get("drs_detection")
+                or i == self.editor_features.get("drs_entry")
+                or i == self.editor_features.get("drs_exit")
             )
             if (
                 self.editor_geometry != "sampled"
@@ -4499,6 +5737,13 @@ class Game:
                 pygame.draw.circle(self.screen, point_color, point, radius)
                 if i == self.editor_width_node:
                     pygame.draw.circle(self.screen, YELLOW, point, radius + 4, 2)
+                if (
+                    self.editor_selected_kind == "route"
+                    and i == self.editor_selected_index
+                ):
+                    pygame.draw.circle(
+                        self.screen, YELLOW, point, radius + 7, 2
+                    )
             if (
                 self.editor_geometry != "sampled"
                 or i % 30 == 0
@@ -4506,12 +5751,92 @@ class Game:
                 or i == self.editor_width_node
             ):
                 self.text(str(i + 1), point + Vector2(6, -15), "small", WHITE)
+        if mouse_world is not None:
+            pygame.draw.line(
+                self.screen, (120, 210, 175),
+                (editor_mouse.x - 7, editor_mouse.y),
+                (editor_mouse.x + 7, editor_mouse.y), 1,
+            )
+            pygame.draw.line(
+                self.screen, (120, 210, 175),
+                (editor_mouse.x, editor_mouse.y - 7),
+                (editor_mouse.x, editor_mouse.y + 7), 1,
+            )
+            coordinate_text = (
+                f"X {mouse_world.x:.1f} m   Y {mouse_world.y:.1f} m"
+            )
+            coordinate_surface = self.fonts["tiny"].render(
+                coordinate_text, True, WHITE
+            )
+            coordinate_rect = coordinate_surface.get_rect()
+            coordinate_rect.topleft = (
+                editor_mouse.x + 14, editor_mouse.y + 14
+            )
+            coordinate_rect.inflate_ip(16, 10)
+            coordinate_rect.clamp_ip(
+                pygame.Rect(8, 8, CANVAS_W - 16, HEIGHT - 16)
+            )
+            pygame.draw.rect(
+                self.screen, (8, 24, 20), coordinate_rect,
+                border_radius=6,
+            )
+            pygame.draw.rect(
+                self.screen, (64, 135, 108), coordinate_rect, 1,
+                border_radius=6,
+            )
+            self.screen.blit(
+                coordinate_surface,
+                coordinate_surface.get_rect(center=coordinate_rect.center),
+            )
         self.screen.set_clip(None)
 
         self.panel("Track Studio", f"World editor • {temp.lap_length_m / 1000:.3f} km" if temp else "World editor")
         self.pill("Points", f"{len(self.editor_points)} / 8", x, 108, 112, YELLOW)
         self.pill("Zoom", f"{self.editor_zoom:.2f}x", x + 122, 108, 114)
+        self.text(
+            (
+                f"CURSOR  X {mouse_world.x:.1f} m  •  Y {mouse_world.y:.1f} m"
+                if mouse_world is not None
+                else "CURSOR  Move onto map"
+            ),
+            (x, 147), "tiny",
+            CYAN if mouse_world is not None else MUTED,
+        )
         self.text("AUTHORING TOOL", (x, 169), "small", MUTED)
+        pit_finish_active = self.editor_tool == "pit_finish"
+        pit_finish_available = bool(self.editor_pitlane_points)
+        pygame.draw.rect(
+            self.screen,
+            (91, 76, 31) if pit_finish_active else
+            (35, 31, 22) if pit_finish_available else (17, 23, 21),
+            pit_finish_rect, border_radius=6,
+        )
+        pygame.draw.rect(
+            self.screen,
+            YELLOW if pit_finish_active else
+            (95, 83, 45) if pit_finish_available else (35, 40, 38),
+            pit_finish_rect, 1, border_radius=6,
+        )
+        self.text(
+            "0 PIT SF", (pit_finish_rect.x + 8, pit_finish_rect.y + 5),
+            "tiny",
+            WHITE if pit_finish_active else
+            MUTED if pit_finish_available else (73, 82, 78),
+        )
+        delete_active = self.editor_tool == "delete"
+        pygame.draw.rect(
+            self.screen,
+            (104, 40, 45) if delete_active else (35, 25, 26),
+            delete_rect, border_radius=6,
+        )
+        pygame.draw.rect(
+            self.screen, RED if delete_active else (83, 52, 54),
+            delete_rect, 1, border_radius=6,
+        )
+        self.text(
+            "9 DEL", (delete_rect.x + 15, delete_rect.y + 5), "tiny",
+            WHITE if delete_active else MUTED,
+        )
         for key, label in tools:
             rect = tool_rects[key]
             active = key == self.editor_tool
@@ -4538,41 +5863,82 @@ class Game:
                 label, (rect.x + 9, rect.y + 10), "small",
                 WHITE if active else MUTED if available else (73, 82, 78),
             )
-        self.text("BORDER DISTANCE", (x, 381), "small", MUTED)
-        self.text(f"{int(self.editor_features.get('border_margin', BORDER_W))} m", (x, 412), "mono", YELLOW)
+        drs_labels = {
+            "drs_detection": "DRS DET",
+            "drs_entry": "DRS IN",
+            "drs_exit": "DRS OUT",
+        }
+        for key, rect in drs_tool_rects.items():
+            active = self.editor_tool == key
+            pygame.draw.rect(
+                self.screen,
+                (41, 78, 63) if active else (15, 30, 25),
+                rect, border_radius=6,
+            )
+            pygame.draw.rect(
+                self.screen, CYAN if active else (37, 58, 50),
+                rect, 1, border_radius=6,
+            )
+            self.text(
+                drs_labels[key], (rect.x + 8, rect.y + 7), "tiny",
+                WHITE if active else MUTED,
+            )
+        self.text("BORDER DISTANCE", (x, 406), "small", MUTED)
+        self.text(f"{int(self.editor_features.get('border_margin', BORDER_W))} m", (x, 433), "mono", YELLOW)
         for rect, symbol in ((minus_border, "−"), (plus_border, "+")):
             pygame.draw.rect(self.screen, (28, 51, 43), rect, border_radius=5)
             self.text(symbol, (rect.x + 12, rect.y + 4), "body", WHITE)
-        self.text("ALL-NODE WIDTH", (x, 444), "small", MUTED)
-        self.text(f"{self.editor_road_width:.1f} m", (x, 466), "mono", YELLOW)
+        self.text("ALL-NODE WIDTH", (x, 458), "small", MUTED)
+        self.text(f"{self.editor_road_width:.1f} m", (x, 485), "mono", YELLOW)
         for rect, symbol in ((minus_road, "−"), (plus_road, "+")):
             pygame.draw.rect(self.screen, (28, 51, 43), rect, border_radius=5)
             self.text(symbol, (rect.x + 12, rect.y + 4), "body", WHITE)
-        pygame.draw.rect(self.screen, (14, 28, 23), (x, 510, 236, 126), border_radius=8)
-        self.text("PHYSICAL SCALE", (x + 12, 522), "small", CYAN)
-        self.text("Hold left on node + wheel", (x + 12, 548), "small", WHITE)
-        selected_width = (
-            f"Node {self.editor_width_node + 1}: "
-            f"{self.editor_widths[self.editor_width_node]:.1f} m"
-            if self.editor_width_node is not None
-            and self.editor_width_node < len(self.editor_widths)
-            else "Select a node to inspect width"
+        pygame.draw.rect(
+            self.screen, (14, 28, 23), (x, 510, 236, 132),
+            border_radius=8,
         )
-        self.text(selected_width, (x + 12, 573), "small", YELLOW)
+        self.text("SELECTED NODE", (x + 12, 520), "small", CYAN)
+        selected_index = self.editor_selected_index
+        selected_kind = self.editor_selected_kind
+        if selected_kind == "route" and selected_index is not None:
+            selected_label = f"NODE {selected_index + 1}"
+            selected_road = self.editor_widths[selected_index]
+            selected_grass = self.editor_grass_widths[selected_index]
+        elif selected_kind == "pit" and selected_index is not None:
+            selected_label = f"PIT P{selected_index + 1}"
+            selected_road = self.editor_pitlane_widths[selected_index]
+            selected_grass = self.editor_pitlane_grass_widths[selected_index]
+        else:
+            selected_label = "RIGHT-CLICK A NODE"
+            selected_road = None
+            selected_grass = None
+        self.text(selected_label, (x + 12, 539), "tiny", YELLOW)
         self.text(
-            (
-                f"PIT ROAD {len(self.editor_pitlane_points)} nodes"
-                f" • {len(self.editor_features.get('pit_boxes', []))} boxes"
-            ),
-            (x + 12, 598), "small",
-            (249, 115, 22) if self.editor_pitlane_points else MUTED,
+            f"Road  {selected_road:.1f} m"
+            if selected_road is not None else "Road  —",
+            (x + 12, 559), "small", WHITE,
         )
         self.text(
-            "80 km/h • PIT IN → PIT OUT",
-            (x + 12, 623), "small",
-            CYAN if self.editor_pitlane_ready() else MUTED,
+            f"Grass {selected_grass:.1f} m"
+            if selected_grass is not None else "Grass —",
+            (x + 12, 597), "small", WHITE,
         )
-        self.footer_hint(("[Esc] Paddock  •  [C] Clear", "[S] Save  •  [Enter] Apply"))
+        for rect, symbol in (
+            (selected_road_minus, "−"), (selected_road_plus, "+"),
+            (selected_grass_minus, "−"), (selected_grass_plus, "+"),
+        ):
+            pygame.draw.rect(
+                self.screen, (28, 51, 43), rect, border_radius=5
+            )
+            self.text(symbol, (rect.x + 10, rect.y + 1), "body", WHITE)
+        self.text(
+            "Right-drag moves • +/- changes width",
+            (x + 12, 625), "tiny", MUTED,
+        )
+        self.footer_hint((
+            "[Esc] Paddock  •  [0] Pit line  •  [9] Delete",
+            "[S] Save  •  [Enter] Apply",
+        ))
 
     def advance_training_cars(self, dt=1.0):
         """Advance one training step with the selected interaction rules."""
@@ -4582,6 +5948,7 @@ class Game:
             # The user's controller must interpret the sensors and steer.
             self.update_race_awareness(assist_passing=False)
             self.update_slipstreams()
+            self.update_drs_gaps(self.cars)
         else:
             for car in self.cars:
                 car.slipstream = 0.0
@@ -4592,6 +5959,7 @@ class Game:
                 car.closing_speed = 0.0
                 car.passing = False
                 car.passing_side = 0.0
+                car.drs_gap_seconds = float("inf")
                 car.opponent_data = (0.0,) * 12
                 car.opponent_presence = (0.0,) * 3
                 car.passing_target = None
@@ -4939,6 +6307,18 @@ class Game:
         collisions = 0
         for i, a in enumerate(self.cars):
             for b in self.cars[i + 1:]:
+                if (
+                    not a.alive or not b.alive
+                    or a.removed_from_track or b.removed_from_track
+                    or a.finish_time is not None
+                    or b.finish_time is not None
+                    or a.pit_timer > 0 or b.pit_timer > 0
+                    or a.in_pitlane or b.in_pitlane
+                ):
+                    # The pit lane is non-colliding: cars can queue and overlap
+                    # without the race-track separation solver pushing them
+                    # through the narrow lane or away from their pit boxes.
+                    continue
                 manifold = self.car_collision_manifold(a, b)
                 if manifold is None:
                     continue
@@ -5527,11 +6907,25 @@ class Game:
         self.text("CAR STATE", (x, 360), "small", MUTED)
         self.text(f"Fuel       {car.fuel:5.1f} kg", (x, 392), "mono", WHITE)
         self.text(f"Tyre wear  {car.tyre_wear:5.1f} %", (x, 422), "mono", WHITE)
-        battery = (
-            f"{car.battery:5.1f}% {'OT' if car.overtake_active else ''}"
-            if car.generation == "Hybrid" else "  ICE"
+        if car.generation == "Hybrid":
+            battery = (
+                f"{car.battery:5.1f}% "
+                f"{'RECHARGE' if car.recharge_active else 'M.O.M.' if car.drs_active else 'OT' if car.overtake_active else ''}"
+            )
+            battery_color = (
+                (77, 171, 247) if car.recharge_active else
+                (34, 197, 94) if car.drs_active else CYAN
+            )
+        else:
+            battery = "DRS"
+            battery_color = (
+                (34, 197, 94) if car.drs_active else
+                (77, 171, 247) if car.drs_eligible else
+                YELLOW
+            )
+        self.text(
+            f"Battery    {battery}", (x, 452), "mono", battery_color
         )
-        self.text(f"Battery    {battery}", (x, 452), "mono", CYAN)
         self.text(f"Limits     {car.track_limits:5}", (x, 482), "mono", WHITE)
         if self.hotlap_finished:
             pygame.draw.rect(self.screen, (24, 56, 46), (x, 510, 240, 92), border_radius=9)
@@ -5948,7 +7342,7 @@ class Game:
                     self.camera_until = 0
                 else:
                     ranked = sorted(
-                        self.cars, key=lambda c: c.score, reverse=True
+                        self.cars, key=self.race_order_key, reverse=True
                     )
                     row = self.race_tower_row(
                         event.pos[1], len(ranked)
@@ -5980,44 +7374,84 @@ class Game:
                 self.weather_popup_until = pygame.time.get_ticks() + 5000
             self.update_race_awareness()
             self.update_slipstreams()
+            self.update_drs_gaps(self.cars)
             for car in self.cars:
-                if car.finish_time is None:
-                    was_punctured = car.puncture
-                    old_stops = car.pitstops
-                    car.update(self.track, rain=self.rain_level)
-                    if car.puncture and not was_punctured:
-                        self.log_event("puncture", f"{car.name} suffered a puncture", "high", self.cars.index(car))
-                    if car.pitstops > old_stops:
-                        self.log_event("pitstop", f"{car.name} completed a pit stop", "medium", self.cars.index(car))
-                    speed_cap = 3.5 if self.flag_state == "SAFETY CAR" else (5.8 if self.flag_state == "YELLOW" else None)
-                    if speed_cap and car.velocity.length() > speed_cap:
-                        car.velocity.scale_to_length(speed_cap)
-                    if car.lap >= self.target_laps:
-                        car.finish_time = self.session_time
-                        self.log_event("finish", f"{car.name} finished", "medium")
+                if car.removed_from_track:
+                    continue
+                if car.finish_time is not None:
+                    car.advance_after_finish(self.track)
+                    continue
+                if not car.alive:
+                    self.retire_race_car(car, "DAMAGE")
+                    continue
+                was_punctured = car.puncture
+                old_stops = car.pitstops
+                car.update(self.track, rain=self.rain_level)
+                self.record_race_timing_sample(car)
+                if car.puncture and not was_punctured:
+                    self.log_event("puncture", f"{car.name} suffered a puncture", "high", self.cars.index(car))
+                if car.pitstops > old_stops:
+                    self.log_event("pitstop", f"{car.name} completed a pit stop", "medium", self.cars.index(car))
+                speed_cap = 3.5 if self.flag_state == "SAFETY CAR" else (5.8 if self.flag_state == "YELLOW" else None)
+                if speed_cap and car.velocity.length() > speed_cap:
+                    car.velocity.scale_to_length(speed_cap)
+                if car.lap >= self.target_laps:
+                    car.finish_time = self.session_time
+                    car.low_speed_seconds = 0.0
+                    car.throttle_input = 0.0
+                    car.brake_input = FINISH_BRAKE_INPUT
+                    self.log_event("finish", f"{car.name} finished", "medium")
+                    continue
+                if car.speed_kph <= LOW_SPEED_DNF_KPH:
+                    car.low_speed_seconds += dt / 1000.0
+                else:
+                    car.low_speed_seconds = 0.0
+                if car.low_speed_seconds >= LOW_SPEED_DNF_SECONDS:
+                    self.retire_race_car(car, "LOW SPEED")
             self.resolve_collisions()
+            for car in self.cars:
+                if (
+                    not car.alive
+                    and car.finish_time is None
+                    and not car.removed_from_track
+                ):
+                    self.retire_race_car(car, "DAMAGE")
             self.replay_tick += 1
             if self.replay_tick % 6 == 0:
                 self.capture_replay_frame()
             if self.event_camera and pygame.time.get_ticks() >= self.camera_until:
-                self.follow = random.randrange(len(self.cars))
+                visible_indexes = [
+                    index for index, car in enumerate(self.cars)
+                    if not car.removed_from_track
+                ]
+                if visible_indexes:
+                    self.follow = random.choice(visible_indexes)
                 self.camera_until = pygame.time.get_ticks() + 30000
-        ranked = sorted(self.cars, key=lambda c: (c.finish_time is not None, c.score), reverse=True)
-        if all(c.finish_time is not None or not c.alive for c in self.cars):
+        ranked = sorted(
+            self.cars, key=self.race_order_key, reverse=True
+        )
+        if all(c.removed_from_track for c in self.cars):
             self.draw_results(ranked)
             return
         self.screen.fill(GRASS)
         self.screen.set_clip(pygame.Rect(0, 0, CANVAS_W, HEIGHT))
+        visible_cars = [
+            car for car in self.cars if not car.removed_from_track
+        ]
+        if self.cars[self.follow].removed_from_track and visible_cars:
+            self.follow = self.cars.index(visible_cars[0])
         focused_car = self.cars[self.follow]
         camera_offset, camera_scale = self.camera_transform(focused_car.position)
         self.track.draw(self.screen, camera_offset, camera_scale)
         for car in reversed(ranked):
+            if car.removed_from_track:
+                continue
             car.draw(
                 self.screen, self.cars.index(car) == self.follow,
                 camera_offset, camera_scale,
             )
         self.screen.set_clip(None)
-        self.draw_minimap(self.cars, focused_car)
+        self.draw_minimap(visible_cars, focused_car)
         self.draw_camera_zoom_control()
         self.draw_tower(ranked)
         if pygame.time.get_ticks() < self.weather_popup_until:
@@ -6075,11 +7509,144 @@ class Game:
                     self.screen, (255, 126, 116), pod.center, 11
                 )
 
+    def record_race_timing_sample(self, car):
+        """Store sparse distance/time samples for live timing interpolation."""
+        history = car.timing_history
+        if not history:
+            history.append((car.score, self.session_time))
+            return
+        if car.score < history[-1][0] + 1.0:
+            return
+        history.append((car.score, self.session_time))
+        minimum_distance = (
+            car.score - self.track.measured_length_m * 1.25
+        )
+        first_kept = bisect_right(
+            history, (minimum_distance, float("inf"))
+        )
+        if first_kept > 1:
+            del history[:first_kept - 1]
+
+    def retire_race_car(self, car, reason="LOW SPEED"):
+        """Classify a DNF and remove the car from the physical circuit."""
+        if car.finish_time is not None or car.removed_from_track:
+            return
+        car.alive = False
+        car.retirement_time = self.session_time
+        car.retirement_reason = reason
+        car.removed_from_track = True
+        car.velocity.update(0.0, 0.0)
+        car.throttle_input = 0.0
+        car.brake_input = 0.0
+        car.overtake_active = False
+        car.drs_active = False
+        car.recharge_active = False
+        self.log_event(
+            "dnf", f"{car.name} retired: {reason.lower()}", "high",
+            self.cars.index(car),
+        )
+
+    @staticmethod
+    def crossing_time_at_distance(car, distance_m):
+        """Interpolate when a car crossed an absolute race distance."""
+        history = car.timing_history
+        if not history or distance_m < history[0][0]:
+            return None
+        index = bisect_right(history, (distance_m, float("inf")))
+        if index == 0:
+            return None
+        if index >= len(history):
+            last_distance, last_time = history[-1]
+            return (
+                last_time
+                if abs(last_distance - distance_m) <= 1e-6
+                else None
+            )
+        left_distance, left_time = history[index - 1]
+        right_distance, right_time = history[index]
+        span = right_distance - left_distance
+        if span <= 1e-9:
+            return right_time
+        fraction = clamp(
+            (distance_m - left_distance) / span, 0.0, 1.0
+        )
+        return left_time + (right_time - left_time) * fraction
+
+    def race_gap_seconds(self, ahead, behind):
+        """Return the live time gap from `behind` to `ahead`."""
+        if (
+            ahead.finish_time is not None
+            and behind.finish_time is not None
+        ):
+            return max(0.0, behind.finish_time - ahead.finish_time)
+        crossing_time = self.crossing_time_at_distance(
+            ahead, behind.score
+        )
+        if crossing_time is not None:
+            return max(0.0, self.session_time - crossing_time)
+        distance_gap = max(0.0, ahead.score - behind.score)
+        effective_speed_mps = max(
+            (
+                ahead.velocity.length()
+                + behind.velocity.length()
+            ) * FPS / 2,
+            25.0,
+        )
+        return distance_gap / effective_speed_mps
+
+    def update_drs_gaps(self, cars=None):
+        """Publish the live time gap to the next car for DRS detection."""
+        field = [
+            car for car in (cars if cars is not None else self.cars)
+            if car.alive and car.finish_time is None
+        ]
+        ranked = sorted(field, key=self.race_order_key, reverse=True)
+        for index, car in enumerate(ranked):
+            car.drs_gap_seconds = (
+                self.race_gap_seconds(ranked[index - 1], car)
+                if index > 0 else float("inf")
+            )
+
+    @staticmethod
+    def format_race_gap(gap_seconds):
+        return (
+            f"+{gap_seconds:5.3f}s"
+            if gap_seconds < 100.0
+            else f"+{gap_seconds:5.1f}s"
+        )
+
+    @staticmethod
+    def race_order_key(car):
+        """Sort running cars by distance and finishers by finish time."""
+        if car.finish_time is not None:
+            return 1, -car.finish_time
+        return 0, car.score
+
     @staticmethod
     def race_tower_row(mouse_y, car_count):
         """Return the integer timetable row under a logical mouse position."""
         row = int((float(mouse_y) - 190.0) // 48.0)
         return row if 0 <= row < min(10, car_count) else None
+
+    def draw_checkered_border(self, rect, square=5):
+        """Draw a compact chequered classification border around a row."""
+        colors = (WHITE, (35, 40, 42))
+        columns = max(1, math.ceil(rect.width / square))
+        rows = max(1, math.ceil(rect.height / square))
+        for column in range(columns):
+            width = min(square, rect.right - (rect.x + column * square))
+            for y, phase in ((rect.y, 0), (rect.bottom - square, 1)):
+                pygame.draw.rect(
+                    self.screen, colors[(column + phase) % 2],
+                    (rect.x + column * square, y, width, square),
+                )
+        for row in range(1, rows - 1):
+            height = min(square, rect.bottom - (rect.y + row * square))
+            for x, phase in ((rect.x, 0), (rect.right - square, 1)):
+                pygame.draw.rect(
+                    self.screen, colors[(row + phase) % 2],
+                    (x, rect.y + row * square, square, height),
+                )
 
     def draw_tower(self, ranked):
         x = CANVAS_W
@@ -6088,8 +7655,8 @@ class Game:
         self.text(f"LAP {min(max(c.lap for c in self.cars)+1, self.target_laps)} / {self.target_laps}", (x + 20, 101), "h2")
         self.text(f"{self.session_time:07.2f}", (x + 178, 108), "mono", YELLOW)
         labels = (
-            "INTERVAL", "GAP TO LEADER", "TYRE / AGE",
-            "PIT STOPS", "CONDITION", "BATTERY / OVERTAKE",
+            "INTERVAL (SECONDS)", "GAP TO LEADER (SECONDS)", "TYRE / AGE",
+            "PIT STOPS", "CONDITION", "BATTERY / ENERGY MODE",
             "FUEL / PIT CALL", "SPEED / GEAR / RPM",
             "AGGRESSION / RISK",
         )
@@ -6108,28 +7675,58 @@ class Game:
         for i, car in enumerate(ranked[:10]):
             y = 190 + i * 48
             focused = self.cars.index(car) == self.follow
+            dnf = (
+                car.finish_time is None
+                and car.retirement_time is not None
+            )
+            finished = car.finish_time is not None
             row_rect = pygame.Rect(x + 10, y, PANEL - 20, 41)
             pygame.draw.rect(
                 self.screen,
+                (37, 40, 41) if dnf else
                 UI_SURFACE_HOVER if focused else UI_SURFACE,
                 row_rect,
                 border_radius=9,
             )
             pygame.draw.rect(
                 self.screen,
+                (100, 104, 106) if dnf else
                 car.color if focused else UI_BORDER,
                 row_rect,
                 1,
                 border_radius=9,
             )
-            pygame.draw.rect(self.screen, car.color, (x + 15, y + 7, 5, 27), border_radius=2)
-            self.text(f"{i+1:>2}", (x + 27, y + 10), "mono", WHITE if focused else MUTED)
-            self.text(car.name, (x + 57, y + 6), "mono", WHITE)
+            if finished:
+                self.draw_checkered_border(row_rect)
+            row_color = (125, 129, 131) if dnf else car.color
+            pygame.draw.rect(self.screen, row_color, (x + 15, y + 7, 5, 27), border_radius=2)
+            self.text(
+                f"{i+1:>2}", (x + 27, y + 10), "mono",
+                (145, 149, 151) if dnf else WHITE if focused else MUTED,
+            )
+            self.text(
+                car.name, (x + 57, y + 6), "mono",
+                (145, 149, 151) if dnf else WHITE,
+            )
+            value_color = (
+                (145, 149, 151) if dnf else
+                CYAN if focused else MUTED
+            )
             if self.metric == 0:
                 previous = ranked[i - 1] if i else leader
-                value = "LEADER" if i == 0 else f"+{previous.score-car.score:4.0f} m"
+                value = (
+                    "LEADER" if i == 0
+                    else self.format_race_gap(
+                        self.race_gap_seconds(previous, car)
+                    )
+                )
             elif self.metric == 1:
-                value = "LEADER" if i == 0 else f"+{leader.score-car.score:4.0f} m"
+                value = (
+                    "LEADER" if i == 0
+                    else self.format_race_gap(
+                        self.race_gap_seconds(leader, car)
+                    )
+                )
             elif self.metric == 2:
                 value = f"{car.tyre[0]} {car.tyre_laps}L/{car.tyre_wear:2.0f}%"
             elif self.metric == 3:
@@ -6147,6 +7744,10 @@ class Game:
                     )
                     pygame.draw.rect(
                         self.screen,
+                        (77, 171, 247)
+                        if car.recharge_active else
+                        (34, 197, 94)
+                        if car.drs_active else
                         YELLOW if car.overtake_active else CYAN,
                         (
                             x + 148, y + 8,
@@ -6157,10 +7758,17 @@ class Game:
                     )
                     value = (
                         f"{car.battery:3.0f}%  "
-                        f"{'OVERTAKE' if car.overtake_active else 'READY'}"
+                        f"{'RECHARGE' if car.recharge_active else 'M.O.M.' if car.drs_active else 'OVERTAKE' if car.overtake_active else 'M.O.M. READY' if car.drs_eligible else 'READY'}"
                     )
                 else:
-                    value = "ICE  •  NO BATTERY"
+                    value = "DRS"
+                    value_color = (
+                        (34, 197, 94)
+                        if car.drs_active else
+                        (77, 171, 247)
+                        if car.drs_eligible else
+                        YELLOW
+                    )
             elif self.metric == 6:
                 value = f"{car.fuel:4.1f}kg  {'PIT' if car.pit_requested else 'RUN'}"
             elif self.metric == 7:
@@ -6179,58 +7787,99 @@ class Game:
                     )
                 )
                 value = f"AGG {car.race_aggression * 100:3.0f}%  {risk}"
-            self.text(value, (x + 148, y + 22), "small", CYAN if focused else MUTED)
+            if dnf:
+                value = "DNF"
+            elif finished:
+                value = "FINISHED"
+            self.text(
+                value, (x + 148, y + 22), "small", value_color
+            )
         if len(ranked) > 10:
             self.text(f"+ {len(ranked)-10} MORE CARS", (x + 20, 675), "small", MUTED)
         self.footer_hint(("[←/→] Metric  •  Wheel/[ ] Zoom", "[Y/C/W/P] Events  •  [Esc] Back"))
 
     def draw_results(self, ranked):
         self.draw_app_background()
-        self.text("RACE CLASSIFICATION", (374, 42), "title")
-        self.text(f"{self.track.name.upper()}  •  {self.target_laps} LAPS", (475, 98), "small", CYAN)
-        podium = [c for c in ranked if c.finish_time is not None][:3]
-        places = [(185, 185, (184, 115, 51)), (455, 135, (255, 197, 45)), (725, 205, (192, 202, 210))]
-        order = [1, 0, 2]
-        for box, index in zip(places, order):
-            if index < len(podium):
-                x, y, medal = box
-                car = podium[index]
-                self.glass_card(
-                    pygame.Rect(x, y, 240, 176),
-                    accent=medal,
-                    radius=16,
-                )
-                pygame.draw.rect(
-                    self.screen, medal, (x, y, 240, 5),
-                    border_radius=3,
-                )
-                self.text(f"P{index+1}", (x + 100, y + 25), "h2", medal)
-                name = self.fonts["h2"].render(car.name, True, car.color)
-                self.screen.blit(name, name.get_rect(center=(x + 120, y + 88)))
-                timing = self.fonts["mono"].render(f"{car.finish_time:.2f}s", True, WHITE)
-                self.screen.blit(timing, timing.get_rect(center=(x + 120, y + 133)))
-        table_x = 985
-        self.text("FULL RESULTS", (table_x, 155), "small", YELLOW)
-        winner_time = podium[0].finish_time if podium else None
-        for i, car in enumerate(ranked[:8]):
-            y = 185 + i * 42
-            row = pygame.Rect(table_x, y, 235, 34)
+        self.text("RACE CLASSIFICATION", (390, 34), "title")
+        self.text(
+            f"{self.track.name.upper()}  •  {self.target_laps} LAPS",
+            (500, 87), "small", CYAN,
+        )
+        finishers = sorted(
+            (car for car in self.cars if car.finish_time is not None),
+            key=lambda car: car.finish_time,
+        )
+        dnfs = sorted(
+            (
+                car for car in self.cars
+                if car.finish_time is None
+            ),
+            key=lambda car: car.score,
+            reverse=True,
+        )
+        classification = finishers + dnfs
+        table = pygame.Rect(70, 125, 1140, 555)
+        self.glass_card(table, accent=YELLOW, radius=15)
+        columns = {
+            "pos": 90, "driver": 175, "status": 465,
+            "time": 690, "pits": 935, "grid": 1060,
+        }
+        self.text("POS", (columns["pos"], 143), "small", MUTED)
+        self.text("DRIVER", (columns["driver"], 143), "small", MUTED)
+        self.text("CLASSIFICATION", (columns["status"], 143), "small", MUTED)
+        self.text("TOTAL TIME", (columns["time"], 143), "small", MUTED)
+        self.text("PIT STOPS", (columns["pits"], 143), "small", MUTED)
+        self.text("START", (columns["grid"], 143), "small", MUTED)
+        pygame.draw.line(
+            self.screen, UI_BORDER, (84, 165), (1196, 165), 1
+        )
+        row_height = min(
+            25, max(20, int(495 / max(len(classification), 1)))
+        )
+        for index, car in enumerate(classification):
+            y = 172 + index * row_height
+            row = pygame.Rect(84, y, 1112, row_height - 3)
+            dnf = car.finish_time is None
             pygame.draw.rect(
-                self.screen, UI_SURFACE, row, border_radius=8
+                self.screen,
+                (38, 41, 42) if dnf else UI_SURFACE,
+                row, border_radius=5,
             )
-            pygame.draw.rect(
-                self.screen, UI_BORDER, row, 1, border_radius=8
+            if not dnf:
+                self.draw_checkered_border(row, square=4)
+            text_color = (137, 141, 143) if dnf else WHITE
+            place = "DNF" if dnf else f"P{index + 1}"
+            status = (
+                car.retirement_reason or "DNF"
+                if dnf else "FINISHED"
             )
-            self.text(f"{i+1:>2}  {car.name}", (table_x + 10, y + 8), "mono", car.color)
-            if car.finish_time is None:
-                value = "DNF"
-            elif i == 0 or winner_time is None:
-                value = f"{car.finish_time:.1f}s"
-            else:
-                value = f"+{car.finish_time-winner_time:.1f}s"
-            self.text(value, (table_x + 170, y + 9), "small", MUTED)
+            total_time = (
+                car.retirement_time
+                if dnf else car.finish_time
+            )
+            self.text(place, (columns["pos"], y + 3), "mono", text_color)
+            self.text(
+                car.name, (columns["driver"], y + 3), "mono",
+                (125, 129, 131) if dnf else car.color,
+            )
+            self.text(status, (columns["status"], y + 3), "small", text_color)
+            self.text(
+                f"{total_time:8.3f}s" if total_time is not None else "—",
+                (columns["time"], y + 3), "mono", text_color,
+            )
+            self.text(
+                str(car.pitstops), (columns["pits"] + 28, y + 3),
+                "mono", text_color,
+            )
+            self.text(
+                f"P{car.starting_position}",
+                (columns["grid"] + 18, y + 3), "mono", text_color,
+            )
         replay = "REPLAY SAVED" if self.replay_saved else "[R] Save replay"
-        self.text(f"{replay}   •   [Esc] Return to paddock", (445, 690), "body", CYAN if self.replay_saved else MUTED)
+        self.text(
+            f"{replay}   •   [Esc] Return to paddock",
+            (445, 704), "body", CYAN if self.replay_saved else MUTED,
+        )
 
     def run(self):
         running = True
