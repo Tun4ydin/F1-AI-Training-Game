@@ -11,9 +11,9 @@ import pygame
 from pygame import Vector2
 
 from main import (
-    Brain, CAR_LENGTH_M, CAR_WIDTH_M, COLORS, DEFAULT_CAMERA_ZOOM, Car,
-    Game, OVERTAKE_REWARD, Track, component_filename, safe_component_name,
-    spawn_car,
+    Brain, CAR_LENGTH_M, CAR_WIDTH_M, COLORS, DEFAULT_CAMERA_ZOOM,
+    HYBRID_RECHARGE_RATE, Car, Game, OVERTAKE_REWARD, Track,
+    component_filename, safe_component_name, spawn_car,
 )
 from safe_algorithm import SafeAlgorithm
 
@@ -60,6 +60,37 @@ class RaceModeTests(unittest.TestCase):
         self.assertIsNone(Game.race_tower_row(670.0, 12))
         self.assertIsNone(Game.race_tower_row(286.0, 2))
 
+    def test_race_camera_follows_classification_across_tower_pages(self):
+        game = object.__new__(Game)
+        game.cars = [
+            Car(
+                Vector2(index, 0), 0, COLORS[index % len(COLORS)],
+                Brain(), name=f"Driver {index + 1}",
+            )
+            for index in range(20)
+        ]
+        # The classification order deliberately differs from the cars list.
+        ranked = list(reversed(game.cars))
+        game.follow = game.cars.index(ranked[9])
+        game.race_tower_page = 0
+        game.event_camera = True
+
+        game.change_race_focus(ranked, 1)
+
+        self.assertIs(game.cars[game.follow], ranked[10])
+        self.assertEqual(game.race_tower_page, 1)
+        self.assertFalse(game.event_camera)
+
+        game.change_race_focus(ranked, -1)
+
+        self.assertIs(game.cars[game.follow], ranked[9])
+        self.assertEqual(game.race_tower_page, 0)
+
+    def test_race_tower_page_bounds_cover_second_ten_drivers(self):
+        self.assertEqual(Game.race_tower_page_bounds(20, 1), (1, 10, 20))
+        self.assertEqual(Game.race_tower_page_bounds(16, 1), (1, 10, 16))
+        self.assertEqual(Game.race_tower_page_bounds(8, 3), (0, 0, 8))
+
     def test_minimap_projection_preserves_aspect_and_stays_in_bounds(self):
         rect = pygame.Rect(12, 28, 196, 126)
         points = [
@@ -79,6 +110,26 @@ class RaceModeTests(unittest.TestCase):
             and rect.top <= point.y <= rect.bottom
             for point in projected
         ))
+
+    def test_pitlane_containment_uses_local_spatial_segments(self):
+        track = self.track
+        self.assertGreaterEqual(len(track.pitlane_centerline), 2)
+        segment = len(track.pitlane_centerline) // 2
+        point = track.pitlane_centerline[segment].copy()
+        exact = track.pitlane_nearest(point)
+        local = track.pitlane_nearest(point, local_only=True)
+        self.assertAlmostEqual(local[0], exact[0], places=7)
+        self.assertEqual(local[2], exact[2])
+        self.assertTrue(track.is_in_pitlane(point))
+
+        cell = (
+            int(point.x // track.spatial_cell_m),
+            int(point.y // track.spatial_cell_m),
+        )
+        candidates = track.pitlane_spatial_segments[cell]
+        self.assertLess(
+            len(candidates), len(track.pitlane_centerline) - 1
+        )
 
     def test_racecraft_training_uses_grid_drafting_and_collisions(self):
         game = object.__new__(Game)
@@ -444,7 +495,9 @@ class RaceModeTests(unittest.TestCase):
         turning.velocity = heading
         starting_angle = turning.angle
         turning.update(self.track)
-        self.assertGreater(abs(turning.angle - starting_angle), 3.7)
+        # Full lock at racing speed should now deliver the more agile
+        # steering response requested for tight and medium-speed corners.
+        self.assertGreater(abs(turning.angle - starting_angle), 4.2)
 
         settled_source = "steering = 0.0\nthrottle = 0.0\n"
         settled = spawn_car(
@@ -536,6 +589,40 @@ class RaceModeTests(unittest.TestCase):
         self.assertGreater(car.battery_regen, 0.0)
         self.assertLess(car.velocity.length(), previous_speed)
 
+    def test_hybrid_recharge_scales_with_throttle_and_stops_at_zero(self):
+        def recharge_car(throttle):
+            source = (
+                "steering = 0.0\n"
+                f"throttle = {throttle}\n"
+                "brake = 0.0\n"
+                "recharge = 1.0\n"
+            )
+            car = spawn_car(
+                self.track,
+                Brain(program=SafeAlgorithm(source), source=source),
+                COLORS[0],
+            )
+            car.generation = "Hybrid"
+            car.battery = 20.0
+            car.update(self.track)
+            return car
+
+        idle = recharge_car(0.0)
+        half_throttle = recharge_car(0.5)
+        full_throttle = recharge_car(1.0)
+
+        self.assertTrue(idle.recharge_active)
+        self.assertEqual(idle.battery_regen, 0.0)
+        self.assertEqual(idle.battery, 20.0)
+        self.assertAlmostEqual(
+            half_throttle.battery_regen,
+            HYBRID_RECHARGE_RATE * 0.5,
+        )
+        self.assertAlmostEqual(
+            full_throttle.battery_regen,
+            HYBRID_RECHARGE_RATE,
+        )
+
     def test_ice_and_hybrid_use_distinct_era_silhouettes(self):
         ice_surface = pygame.Surface((260, 160), pygame.SRCALPHA)
         hybrid_surface = pygame.Surface((260, 160), pygame.SRCALPHA)
@@ -553,6 +640,26 @@ class RaceModeTests(unittest.TestCase):
             pygame.mask.from_surface(ice_surface).count(),
             pygame.mask.from_surface(hybrid_surface).count(),
         )
+
+    def test_car_sprite_rotation_is_reused_between_frames(self):
+        from main import _CAR_ROTATION_CACHE, _CAR_SPRITE_CACHE
+
+        _CAR_ROTATION_CACHE.clear()
+        _CAR_SPRITE_CACHE.clear()
+        surface = pygame.Surface((260, 160), pygame.SRCALPHA)
+        car = Car(
+            Vector2(16, 10), 13.0, (101, 149, 211), Brain(),
+            generation="Hybrid",
+        )
+        car.draw(surface, scale=8.0)
+        first_rotation_count = len(_CAR_ROTATION_CACHE)
+        first_base_count = len(_CAR_SPRITE_CACHE)
+        car.angle = 13.2
+        car.draw(surface, scale=8.0)
+        self.assertEqual(len(_CAR_ROTATION_CACHE), first_rotation_count)
+        self.assertEqual(len(_CAR_SPRITE_CACHE), first_base_count)
+        self.assertEqual(first_rotation_count, 1)
+        self.assertEqual(first_base_count, 1)
 
     def test_default_camera_keeps_car_art_readable_at_true_scale(self):
         surface = pygame.Surface((260, 160), pygame.SRCALPHA)

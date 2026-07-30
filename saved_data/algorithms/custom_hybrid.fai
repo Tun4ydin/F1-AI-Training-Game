@@ -40,9 +40,8 @@ launch_deploy_kph  = parameter(205.0, 170.0, 230.0)
 straight_commit    = parameter(0.72, 0.50, 0.90)
 regen_gain         = parameter(0.68, 0.25, 1.10)
 deploy_level       = parameter(24.0, 8.0, 72.0)
-small_steering     = 0.10
-recharge_enter     = 10.0
-recharge_exit      = 40.0
+recharge_enter     = 70.0
+recharge_throttle  = 0.80
 wear_caution       = parameter(0.28, 0.00, 0.60)
 pit_wear           = parameter(0.70, 0.40, 0.92)
 
@@ -592,70 +591,65 @@ if committed_acceleration > 0.5:
     throttle = 1.0
     brake = 0.0
 
-# Below 10% battery, seventh or eighth gear and no braking latch Recharge.
-# Once latched it remains selected until the battery passes 40%. The car model
-# scales recovered energy with throttle, so zero throttle adds no charge.
-recharge_entry = (
-    is_hybrid > 0.5
-    and recharging < 0.5
-    and battery_soc < recharge_enter
-    and brake <= 0.0
-    and actual_gear >= 7.0
+# Below 70% battery, lifting for an approaching braking zone latches Recharge.
+# It stays active through trail braking and the corner. The first return above
+# 80% throttle releases Recharge immediately so acceleration can resume.
+braking_zone_near = (
+    brake > 0.01
+    or slow_corner_demand > 0.03
+    or entry_severity > fast_corner_limit * 0.70
 )
 recharge = 0.0
 if (
     is_hybrid > 0.5
     and recharging > 0.5
-    and battery_soc <= recharge_exit
+    and battery_soc < 100.0
+    and throttle <= recharge_throttle
 ):
     recharge = 1.0
-if recharge_entry > 0.5:
+if (
+    is_hybrid > 0.5
+    and recharging < 0.5
+    and battery_soc < recharge_enter
+    and braking_zone_near > 0.5
+    and throttle <= recharge_throttle
+    and active_passing < 0.5
+):
     recharge = 1.0
+if throttle > recharge_throttle:
+    recharge = 0.0
 
-# Deploy on straights, near the top of a gear, or to complete a pass. Above
-# 150 km/h the car may also deploy while turning as long as it is not braking
-# and still has positive throttle.
-normal_deployment = (
-    throttle > 0.80
-    and abs(steering) <= small_steering
-)
-high_speed_turn_deployment = (
-    actual_speed > 150.0
-    and abs(steering) > 0.03
-    and throttle > 0.0
-    and brake <= 0.01
-)
-deployment_allowed = max(
-    normal_deployment,
-    high_speed_turn_deployment
-)
+# Deploy on straights, near the top of a gear, or to complete a pass. Actual
+# battery percentage, gear number, and RPM remove normalized-unit ambiguity.
+# Braking and meaningful steering always reserve the MGU-K for regeneration.
 overtake = 0.0
 if (
     is_hybrid > 0.5
     and recharge < 0.5
-    and deployment_allowed > 0.5
+    and throttle > 0.80
     and brake <= 0.01
+    and abs(steering) <= 0.10
     and battery_soc > deploy_level * (
         1.0 - dynamic_aggression * 0.35
     )
-    and actual_gear >= 2.0
+    and actual_gear >= 3.0
     and (
     (
         launch_straight > 0.5
         and brake < 0.02
     )
     or (
-        curve_demand < 0.34
-        and forward > 0.66
-        and actual_gear >= 2.0
-        and actual_rpm > 6200.0
-        and traction > 0.78
-        and tire_slip < 0.20
+        curve_demand < 0.20
+        and forward > 0.72
+        and actual_gear >= 3.0
+        and actual_rpm > 7200.0
+        and traction > 0.82
+        and tire_slip < 0.16
         and brake < 0.02
     )
     or (
         actual_rpm > 11200.0
-        and curve_demand < 0.28
+        and curve_demand < 0.16
         and traction > 0.80
         and brake < 0.02
     )
@@ -664,11 +658,6 @@ if (
         and forward > 0.55
         and traction > 0.70
         and brake < 0.02
-    )
-    or (
-        high_speed_turn_deployment > 0.5
-        and traction > 0.72
-        and tire_slip < 0.25
     )
     )
 ):
@@ -689,6 +678,7 @@ if off_track > 0.5:
     brake = 0.0
     throttle = min(max(throttle, 0.18), 0.32)
     overtake = 0.0
+    recharge = 0.0
     steering = clamp(
         (heading_error * 1.45) - (racing_line_offset * 0.85),
         -1.0,
@@ -708,15 +698,8 @@ if recharge > 0.5:
     overtake = 0.0
 
 # Final safety arbitration runs after every recovery and traffic branch.
-# Braking always cancels deployment. Below 150 km/h, the normal 80%-throttle
-# and mild-steering requirements still apply.
-if (
-    brake > 0.01
-    or (
-        normal_deployment < 0.5
-        and high_speed_turn_deployment < 0.5
-    )
-):
+# Trail braking while turning harvests energy and can never deploy it.
+if throttle <= 0.80 or brake > 0.01 or abs(steering) > 0.10:
     overtake = 0.0
 
 pit_request = 0.0

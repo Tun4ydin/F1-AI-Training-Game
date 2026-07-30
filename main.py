@@ -5,12 +5,18 @@ import math
 import random
 import re
 from bisect import bisect_right
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pygame
 from pygame import Vector2
 from safe_algorithm import AlgorithmError, SafeAlgorithm
+
+try:
+    import pygame_gui
+except ImportError:
+    pygame_gui = None
 
 WIDTH, HEIGHT = 1280, 760
 DISPLAY_WIDTH, DISPLAY_HEIGHT = 1920, 1080
@@ -45,21 +51,28 @@ GEAR_SPEED_LIMITS = tuple(
 # Straight-line calibration targets:
 # combustion only: 0–100 ≈ 2.6 s and 0–200 ≈ 5.0 s;
 # deployment from third gear: 0–200 ≈ 4.6 s.
-BASE_ENGINE_ACCELERATION = 0.0066
-LOW_SPEED_TRACTION = 0.32
+BASE_ENGINE_ACCELERATION = 0.0086
+LOW_SPEED_TRACTION = 0.52
 FULL_TRACTION_SPEED = 0.60
 HYBRID_COMBUSTION_SHARE = 0.80
 HYBRID_ELECTRIC_SHARE = 0.20
-HYBRID_DRS_ELECTRIC_BONUS = 0.10
+HYBRID_DRS_ELECTRIC_BONUS = 0.30
 HYBRID_TOTAL_POWER_SCALE = 1.1875
-HYBRID_REGEN_RATE = 0.16
-HYBRID_RECHARGE_RATE = 3.5 / FPS
+HYBRID_REGEN_RATE = 0.46
+HYBRID_RECHARGE_RATE = 5.5 / FPS
 HYBRID_RECHARGE_COMBUSTION_SHARE = 0.70
 ROLLING_RESISTANCE = 0.00035
-AERO_DRAG_COEFFICIENT = 0.00076
-ICE_DRS_DRAG_MULTIPLIER = 0.80
+AERO_DRAG_COEFFICIENT = 0.00056
+ICE_DRS_DRAG_MULTIPLIER = 0.30
 DRS_MAX_GAP_SECONDS = 1.0
-OPPONENT_SENSOR_RANGE_M = 60.0
+# Steering is expressed as degrees of yaw per simulation frame. These values
+# give full-lock inputs more authority through medium- and high-speed corners
+# without changing the controller's normalized -1..1 steering contract.
+STEERING_BASE_YAW = 3.68
+STEERING_SPEED_YAW = 0.79
+STEERING_UNDERSTEER_LOSS = 0.12
+LATERAL_GRIP_RECOVERY = 0.24
+OPPONENT_SENSOR_RANGE_M = 40.0
 OVERTAKE_REWARD = 150.0
 OVERTAKE_COOLDOWN_FRAMES = FPS * 3
 LOW_SPEED_DNF_KPH = 10.0
@@ -105,10 +118,106 @@ COLORS = [
     (219, 39, 119), (13, 148, 136), (203, 213, 225), (100, 116, 139),
 ]
 _CAR_SPRITE_CACHE = {}
+_CAR_MASTER_CACHE = {}
+_CAR_ROTATION_CACHE = OrderedDict()
+CAR_ROTATION_STEP_DEGREES = 3
+CAR_ROTATION_CACHE_LIMIT = 3072
+CAR_MASTER_PATHS = {
+    "ICE": ROOT / "assets" / "cars" / "ice_2000s_master.png",
+    "Hybrid": ROOT / "assets" / "cars" / "hybrid_2022_master.png",
+}
 
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def load_car_master(generation):
+    """Load and tightly crop one transparent era-specific source sprite."""
+    era = "Hybrid" if generation == "Hybrid" else "ICE"
+    cached = _CAR_MASTER_CACHE.get(era)
+    if cached is not None:
+        return cached
+    image = pygame.image.load(str(CAR_MASTER_PATHS[era]))
+    if pygame.display.get_surface() is not None:
+        image = image.convert_alpha()
+    bounds = image.get_bounding_rect(min_alpha=8)
+    if bounds.width and bounds.height:
+        image = image.subsurface(bounds).copy()
+    _CAR_MASTER_CACHE[era] = image
+    return image
+
+
+def build_car_sprite(generation, color, scale):
+    """Build one recolored, correctly scaled sprite from a master PNG."""
+    era = "Hybrid" if generation == "Hybrid" else "ICE"
+    cache_key = (era, tuple(color), round(float(scale), 3))
+    cached = _CAR_SPRITE_CACHE.get(cache_key)
+    if cached is not None:
+        return cache_key, cached
+
+    logical_length = max(18, round(CAR_LENGTH_M * scale))
+    logical_width = max(8, round(CAR_WIDTH_M * scale))
+    master = load_car_master(era)
+    body = pygame.transform.smoothscale(
+        master, (logical_length, logical_width)
+    )
+    # The masters use neutral white bodywork. Multiplication retains their
+    # painted highlights, carbon fibre, tyres and mechanical detail while
+    # assigning each entry its chosen livery color.
+    livery = tuple(
+        min(255, round(channel * 0.78 + 55))
+        for channel in color
+    )
+    body.fill((*livery, 255), special_flags=pygame.BLEND_RGBA_MULT)
+    padding = max(5, round(scale * 0.70))
+    sprite = pygame.Surface(
+        (
+            logical_length + padding * 2,
+            logical_width + padding * 2,
+        ),
+        pygame.SRCALPHA,
+    )
+    sprite.blit(body, (padding, padding))
+    _CAR_SPRITE_CACHE[cache_key] = sprite
+    return cache_key, sprite
+
+
+def rotated_car_sprite(generation, color, scale, angle):
+    """Return one cached livery, rotation and shadow composite."""
+    base_key, base = build_car_sprite(generation, color, scale)
+    rotation = (
+        round(float(angle) / CAR_ROTATION_STEP_DEGREES)
+        * CAR_ROTATION_STEP_DEGREES
+    ) % 360
+    cache_key = (*base_key, rotation)
+    cached = _CAR_ROTATION_CACHE.pop(cache_key, None)
+    if cached is not None:
+        _CAR_ROTATION_CACHE[cache_key] = cached
+        return cached
+
+    rotated = pygame.transform.rotozoom(base, -rotation, 1.0)
+    composite = pygame.Surface(
+        (rotated.get_width() + 8, rotated.get_height() + 8),
+        pygame.SRCALPHA,
+    )
+    shadow = rotated.copy()
+    shadow.fill(
+        (18, 22, 22, 96), special_flags=pygame.BLEND_RGBA_MULT
+    )
+    composite.blit(shadow, (6, 7))
+    composite.blit(rotated, (4, 4))
+    _CAR_ROTATION_CACHE[cache_key] = composite
+    while len(_CAR_ROTATION_CACHE) > CAR_ROTATION_CACHE_LIMIT:
+        _CAR_ROTATION_CACHE.popitem(last=False)
+    return composite
+
+
+def prewarm_car_sprites(scale=DEFAULT_CAMERA_ZOOM):
+    """Prepare every standard livery at the normal driving-camera scale."""
+    for generation in ("ICE", "Hybrid"):
+        for color in COLORS:
+            build_car_sprite(generation, color, scale)
 
 
 def safe_component_name(name, fallback="Untitled"):
@@ -269,6 +378,55 @@ class Track:
             for cell_x in range(minimum_x, maximum_x + 1):
                 for cell_y in range(minimum_y, maximum_y + 1):
                     self.spatial_segments.setdefault((cell_x, cell_y), set()).add(index)
+        # Surface probes and AI raycasts call ``is_in_pitlane`` thousands of
+        # times per frame.  Keep a separate index for the open pit road so
+        # those probes only inspect the segment(s) in their current cell.
+        self.pitlane_spatial_segments = {}
+        self.pitlane_bounds = None
+        if len(self.pitlane_centerline) < 2:
+            return
+        maximum_half_width = max(
+            self.pitlane_centerline_widths_m,
+            default=PITLANE_WIDTH_M,
+        ) / 2
+        self.pitlane_bounds = (
+            min(point.x for point in self.pitlane_centerline)
+            - maximum_half_width,
+            min(point.y for point in self.pitlane_centerline)
+            - maximum_half_width,
+            max(point.x for point in self.pitlane_centerline)
+            + maximum_half_width,
+            max(point.y for point in self.pitlane_centerline)
+            + maximum_half_width,
+        )
+        for index in range(len(self.pitlane_centerline) - 1):
+            start = self.pitlane_centerline[index]
+            end = self.pitlane_centerline[index + 1]
+            segment_half_width = max(
+                self.pitlane_centerline_widths_m[index],
+                self.pitlane_centerline_widths_m[index + 1],
+            ) / 2
+            minimum_x = math.floor(
+                (min(start.x, end.x) - segment_half_width)
+                / self.spatial_cell_m
+            )
+            maximum_x = math.floor(
+                (max(start.x, end.x) + segment_half_width)
+                / self.spatial_cell_m
+            )
+            minimum_y = math.floor(
+                (min(start.y, end.y) - segment_half_width)
+                / self.spatial_cell_m
+            )
+            maximum_y = math.floor(
+                (max(start.y, end.y) + segment_half_width)
+                / self.spatial_cell_m
+            )
+            for cell_x in range(minimum_x, maximum_x + 1):
+                for cell_y in range(minimum_y, maximum_y + 1):
+                    self.pitlane_spatial_segments.setdefault(
+                        (cell_x, cell_y), set()
+                    ).add(index)
 
     def _turn_angle(self, index):
         if len(self.points) < 3:
@@ -510,11 +668,25 @@ class Track:
             right.append(point - normal * half_width)
         return left, right
 
-    def pitlane_nearest(self, point):
-        """Return distance and position on the open pitlane polyline."""
+    def pitlane_nearest(self, point, local_only=False):
+        """Return distance and position on the open pitlane polyline.
+
+        ``local_only`` is for containment queries.  Every pit segment is
+        indexed with its full road half-width, so a point that can be inside
+        the pitlane is guaranteed to find that segment in its own cell.
+        General callers retain the exact full-polyline nearest-point result.
+        """
         point = Vector2(point)
         best = (float("inf"), Vector2(), None, 0.0)
-        for index in range(max(0, len(self.pitlane_centerline) - 1)):
+        if local_only:
+            cell = (
+                math.floor(point.x / self.spatial_cell_m),
+                math.floor(point.y / self.spatial_cell_m),
+            )
+            candidates = self.pitlane_spatial_segments.get(cell, ())
+        else:
+            candidates = range(max(0, len(self.pitlane_centerline) - 1))
+        for index in candidates:
             distance, nearest, ratio = seg_distance(
                 point,
                 self.pitlane_centerline[index],
@@ -545,7 +717,14 @@ class Track:
     def is_in_pitlane(self, point):
         if len(self.pitlane_centerline) < 2:
             return False
-        distance, _, segment, ratio = self.pitlane_nearest(point)
+        point = Vector2(point)
+        if self.pitlane_bounds is not None:
+            left, top, right, bottom = self.pitlane_bounds
+            if not left <= point.x <= right or not top <= point.y <= bottom:
+                return False
+        distance, _, segment, ratio = self.pitlane_nearest(
+            point, local_only=True
+        )
         if segment is None:
             return False
         widths = self.pitlane_centerline_widths_m
@@ -1785,34 +1964,64 @@ class Car:
         entry_distance = float("inf")
         recovering_from_runoff = False
         straight_exit = False
-        if self.in_pitlane:
-            self.pit_entry_committed = False
-            if self.position.distance_to(
-                track.pitlane_centerline[-1]
-            ) <= 40.0:
-                # Keep control through the merge after the centre leaves the
-                # narrow pit-lane ribbon.
-                self.pit_exit_straight_frames = FPS * 0.5
-                self.pit_exit_guidance_frames = 90.0
-            target = track.pitlane_point_ahead(
-                self.position,
-                clamp(self.velocity.length() * 32.0, 10.0, 24.0),
+
+        def pit_exit_target():
+            """Aim from PIT OUT toward the following authored track node."""
+            exit_node = track.features.get("pit_exit")
+            if exit_node is None or not track.points:
+                return track.pitlane_centerline[-1]
+            # PIT OUT is normally already behind the car when merge guidance
+            # begins. Using its distance plus a fixed offset can still leave
+            # the target behind on long editor sections. Anchor guidance to
+            # the next actual track node instead.
+            next_node = (
+                int(exit_node) + 1
+            ) % len(track.points)
+            next_segment = (
+                next_node
+            ) * track.samples_per_section
+            next_progress_m = track.cumulative_lengths_m[next_segment]
+            guidance_elapsed = max(
+                0.0, 90.0 - self.pit_exit_guidance_frames
             )
-        elif self.pit_exit_straight_frames > 0.0:
+            return track.point_at_distance(
+                next_progress_m + guidance_elapsed * 0.55
+            )
+
+        # Once the exit is armed it owns steering even while the car's centre
+        # is still inside the pit-lane surface. Previously the in-pit branch
+        # reset this timer every frame, delaying zero-steer until it was too
+        # late and allowing the nearest-track lookup to select a right-hand
+        # section of circuit.
+        if self.pit_exit_straight_frames > 0.0:
             self.pit_exit_straight_frames = max(
                 0.0, self.pit_exit_straight_frames - 1.0
             )
+            self.pit_entry_committed = False
             straight_exit = True
             target = None
         elif self.pit_exit_guidance_frames > 0.0:
             self.pit_exit_guidance_frames = max(
                 0.0, self.pit_exit_guidance_frames - 1.0
             )
-            current_progress_m = track.progress_metres(self.position)
-            target = track.point_at_distance(
-                current_progress_m
-                + clamp(self.velocity.length() * 28.0, 20.0, 34.0)
-            )
+            self.pit_entry_committed = False
+            target = pit_exit_target()
+        elif self.in_pitlane:
+            self.pit_entry_committed = False
+            if self.position.distance_to(
+                track.pitlane_centerline[-1]
+            ) <= 18.0:
+                # Begin the straight phase before leaving the pit ribbon. Arm
+                # this only once; the active phase has priority next frame.
+                self.pit_exit_straight_frames = FPS * 0.5
+                self.pit_exit_guidance_frames = 90.0
+                straight_exit = True
+                target = None
+            else:
+                target = track.pitlane_point_ahead(
+                    self.position,
+                    clamp(self.velocity.length() * 32.0, 10.0, 24.0),
+                )
         elif self.pit_requested:
             entry = track.features.get("pit_entry")
             if entry is None or not track.points:
@@ -1869,12 +2078,12 @@ class Car:
             # Once a committed car leaves the paved merge, stop following the
             # normal racing-line blend and aim directly into the pit route.
             target = (
-                track.pitlane_point_ahead(self.position, 8.0)
-                if self.in_pitlane
-                else track.point_at_distance(
-                    track.progress_metres(self.position) + 20.0
-                )
+                None
+                if straight_exit
+                else pit_exit_target()
                 if self.pit_exit_guidance_frames > 0.0
+                else track.pitlane_point_ahead(self.position, 8.0)
+                if self.in_pitlane
                 else track.pitlane_centerline[
                     min(1, len(track.pitlane_centerline) - 1)
                 ]
@@ -2146,7 +2355,15 @@ class Car:
                 * dt
             )
             if self.recharge_active:
-                self.battery_regen += HYBRID_RECHARGE_RATE * dt
+                # Throttle is normalized to 0.0–1.0, making this equivalent
+                # to recharge_rate * (throttle_applied_percent / 100).
+                # Recharge therefore produces no energy at zero throttle.
+                throttle_applied = clamp(throttle, 0.0, 1.0)
+                self.battery_regen += (
+                    HYBRID_RECHARGE_RATE
+                    * throttle_applied
+                    * dt
+                )
             battery_drain = (
                 electric_deployment * 0.08
                 + hybrid_drs_deployment * 0.04
@@ -2189,9 +2406,8 @@ class Car:
             + float(self.puncture) * 0.35,
             0.0, 1.0,
         )
-        # Understeer now builds more gradually, clears faster when the front
-        # tyres recover, and removes at most 18% of steering authority. It
-        # remains useful telemetry without overwhelming the driving command.
+        # Understeer remains useful telemetry but cannot overwhelm a full
+        # steering command. The front axle keeps at least 88% authority.
         understeer_response = clamp(
             (0.14 if understeer_target > self.understeer else 0.26) * dt,
             0.0, 1.0,
@@ -2206,8 +2422,14 @@ class Car:
         # Fast steering-rack response and stronger lateral tyre recovery make
         # the car rotate into an apex sooner, then settle cleanly on exit.
         self.angle += (
-            steer * (3.25 + speed * 0.68) * grip * tyre_grip * aero_grip
-            * (1.0 - self.understeer * 0.18 + self.oversteer * 0.20)
+            steer
+            * (STEERING_BASE_YAW + speed * STEERING_SPEED_YAW)
+            * grip * tyre_grip * aero_grip
+            * (
+                1.0
+                - self.understeer * STEERING_UNDERSTEER_LOSS
+                + self.oversteer * 0.20
+            )
             * dt
         )
         self.update_drivetrain(throttle)
@@ -2255,7 +2477,7 @@ class Car:
 
         lateral = self.velocity - forward * self.velocity.dot(forward)
         self.velocity -= lateral * clamp(
-            grip * tyre_grip * 0.22
+            grip * tyre_grip * LATERAL_GRIP_RECOVERY
             * (1.0 - draft * 0.28)
             * (1.0 - self.oversteer * 0.62),
             0.025, 0.27,
@@ -2535,6 +2757,30 @@ class Car:
         self.alive = self.health > 0
 
     def draw(self, screen, focused=False, offset=Vector2(), scale=1.0):
+        """Blit one prepared era/livery/rotation sprite for this car."""
+        try:
+            sprite = rotated_car_sprite(
+                self.generation, self.color, scale, self.angle
+            )
+        except (FileNotFoundError, OSError, pygame.error):
+            # Keep source checkouts usable if an asset is accidentally absent.
+            return self._draw_legacy_procedural(
+                screen, focused, offset, scale
+            )
+        screen_position = self.position * scale + offset
+        screen.blit(
+            sprite, sprite.get_rect(center=screen_position)
+        )
+        if focused:
+            pygame.draw.circle(
+                screen, CYAN, screen_position,
+                max(12, round(2.2 * scale)), 2,
+            )
+
+    def _draw_legacy_procedural(
+        self, screen, focused=False, offset=Vector2(), scale=1.0
+    ):
+        """Fallback renderer used only when packaged sprite assets are absent."""
         # Cars keep their true 5.6 m x 2.0 m footprint. Four-times
         # oversampling and a per-era cache preserve small mechanical details
         # after the world is scaled and the sprite is rotated.
@@ -2969,7 +3215,7 @@ class Button:
         self.title = title
         self.subtitle = subtitle
 
-    def draw(self, screen, fonts, mouse):
+    def draw(self, screen, fonts, mouse, draw_text=None):
         hover = self.rect.collidepoint(mouse)
         try:
             index = max(0, int(self.title.split()[0]) - 1)
@@ -3005,20 +3251,37 @@ class Button:
         )
         pygame.draw.rect(screen, accent, badge, 1, border_radius=12)
         number = self.title.split()[0]
-        number_surface = fonts["mono"].render(number, True, accent)
-        screen.blit(
-            number_surface,
-            number_surface.get_rect(center=badge.center),
-        )
         clean_title = self.title[len(number):].strip()
-        screen.blit(
-            fonts["h2"].render(clean_title, True, WHITE),
-            (self.rect.x + 82, self.rect.y + 17),
-        )
-        screen.blit(
-            fonts["small"].render(self.subtitle, True, MUTED),
-            (self.rect.x + 82, self.rect.y + 52),
-        )
+        if draw_text is None:
+            number_surface = fonts["mono"].render(
+                number, True, accent
+            )
+            screen.blit(
+                number_surface,
+                number_surface.get_rect(center=badge.center),
+            )
+            screen.blit(
+                fonts["h2"].render(clean_title, True, WHITE),
+                (self.rect.x + 82, self.rect.y + 17),
+            )
+            screen.blit(
+                fonts["small"].render(self.subtitle, True, MUTED),
+                (self.rect.x + 82, self.rect.y + 52),
+            )
+        else:
+            draw_text(
+                number, badge.center, "mono", accent, anchor="center"
+            )
+            draw_text(
+                clean_title,
+                (self.rect.x + 82, self.rect.y + 17),
+                "h2", WHITE,
+            )
+            draw_text(
+                self.subtitle,
+                (self.rect.x + 82, self.rect.y + 52),
+                "small", MUTED,
+            )
         arrow = pygame.Rect(self.rect.right - 48, self.rect.centery - 16, 32, 32)
         pygame.draw.rect(
             screen,
@@ -3026,10 +3289,18 @@ class Button:
             arrow,
             border_radius=10,
         )
-        arrow_text = fonts["body"].render(
-            "→", True, INK if hover else MUTED
-        )
-        screen.blit(arrow_text, arrow_text.get_rect(center=arrow.center))
+        if draw_text is None:
+            arrow_text = fonts["body"].render(
+                ">", True, INK if hover else MUTED
+            )
+            screen.blit(
+                arrow_text, arrow_text.get_rect(center=arrow.center)
+            )
+        else:
+            draw_text(
+                ">", arrow.center, "body",
+                INK if hover else MUTED, anchor="center",
+            )
         return hover
 
 
@@ -3050,35 +3321,50 @@ class Game:
         self.window = pygame.display.set_mode(
             initial_window_size, self.display_flags
         )
+        try:
+            prewarm_car_sprites()
+        except (FileNotFoundError, OSError, pygame.error):
+            # Car.draw retains a procedural fallback for incomplete packages.
+            pass
         self.screen = pygame.Surface((WIDTH, HEIGHT)).convert()
         self._ui_background = None
         self._present_surface = None
         self._present_size = None
         self._minimap_cache = {}
+        self._native_text_commands = []
+        self._native_font_cache = {}
+        self.native_ui_modes = {
+            "menu", "editor", "algorithm", "race_setup",
+            "hotlap_setup", "name_dialog",
+        }
         self.viewport_scale = 1.0
         self.viewport_rect = pygame.Rect(0, 0, WIDTH, HEIGHT)
         self.update_viewport()
         self.clock = pygame.time.Clock()
         self.show_fps = False
+        self.font_specs = {
+            "title": (
+                "Inter, SF Pro Display, Avenir Next, Arial", 44, True
+            ),
+            "h2": (
+                "Inter, SF Pro Display, Avenir Next, Arial", 25, True
+            ),
+            "body": (
+                "Inter, SF Pro Text, Avenir Next, Arial", 18, False
+            ),
+            "small": (
+                "Inter, SF Pro Text, Avenir Next, Arial", 14, False
+            ),
+            "tiny": (
+                "Inter, SF Pro Text, Avenir Next, Arial", 12, False
+            ),
+            "mono": (
+                "SF Mono, Menlo, Consolas, monospace", 16, True
+            ),
+        }
         self.fonts = {
-            "title": pygame.font.SysFont(
-                "Inter, SF Pro Display, Avenir Next, Arial", 44, bold=True
-            ),
-            "h2": pygame.font.SysFont(
-                "Inter, SF Pro Display, Avenir Next, Arial", 25, bold=True
-            ),
-            "body": pygame.font.SysFont(
-                "Inter, SF Pro Text, Avenir Next, Arial", 18
-            ),
-            "small": pygame.font.SysFont(
-                "Inter, SF Pro Text, Avenir Next, Arial", 14
-            ),
-            "tiny": pygame.font.SysFont(
-                "Inter, SF Pro Text, Avenir Next, Arial", 12
-            ),
-            "mono": pygame.font.SysFont(
-                "SF Mono, Menlo, Consolas, monospace", 16, bold=True
-            ),
+            key: pygame.font.SysFont(family, size, bold=bold)
+            for key, (family, size, bold) in self.font_specs.items()
         }
         spa_path = TRACK_DIR / "spa_francorchamps.json"
         self.track = Track.load(spa_path) if spa_path.exists() else Track()
@@ -3095,6 +3381,7 @@ class Game:
         self.paused = False
         self.session_time = 0.0
         self.follow = 0
+        self.race_tower_page = 0
         self.message = ""
         self.message_until = 0
         self.metric = 0
@@ -3186,6 +3473,71 @@ class Game:
         self.name_dialog_background = None
         self.race_countdown = 0.0
         self.race_lights_out_flash = 0.0
+        self.menu_ui_manager = None
+        self.menu_ui_buttons = []
+        self.menu_ui_targets = {}
+        # The native card renderer carries subtitles, badges and richer hover
+        # feedback than a stock widget while still using pygame_gui elsewhere
+        # when a future screen needs its layout engine.
+
+    def setup_menu_ui(self):
+        """Build the first pygame_gui screen without affecting game drawing."""
+        if pygame_gui is None:
+            return
+        theme = {
+            "button": {
+                "colours": {
+                    "normal_bg": "#122724",
+                    "hovered_bg": "#193731",
+                    "active_bg": "#43E1BE",
+                    "selected_bg": "#193731",
+                    "disabled_bg": "#0D1C1B",
+                    "normal_text": "#EFF7F4",
+                    "hovered_text": "#43E1BE",
+                    "active_text": "#04090C",
+                    "selected_text": "#43E1BE",
+                    "disabled_text": "#849994",
+                    "normal_border": "#304E48",
+                    "hovered_border": "#43E1BE",
+                    "active_border": "#43E1BE",
+                    "selected_border": "#43E1BE",
+                    "disabled_border": "#203631",
+                },
+                "font": {
+                    "name": "noto_sans",
+                    "size": "18",
+                    "bold": "1",
+                },
+                "misc": {
+                    "shape": "rounded_rectangle",
+                    "shape_corner_radius": "14",
+                    "border_width": "1",
+                    "shadow_width": "3",
+                    "text_horiz_alignment": "left",
+                    "text_horiz_alignment_padding": "24",
+                },
+            }
+        }
+        self.menu_ui_manager = pygame_gui.UIManager(
+            (WIDTH, HEIGHT),
+            theme,
+            enable_live_theme_updates=False,
+        )
+        definitions = (
+            ((70, 175, 535, 86), "01   TRACK STUDIO"),
+            ((675, 175, 535, 86), "02   AI TRAINING"),
+            ((70, 280, 535, 86), "03   RACE WEEKEND"),
+            ((675, 280, 535, 86), "04   TWO-LAP HOTLAP"),
+        )
+        for index, (rect, label) in enumerate(definitions):
+            button = pygame_gui.elements.UIButton(
+                relative_rect=pygame.Rect(rect),
+                text=label,
+                manager=self.menu_ui_manager,
+                object_id=f"#workspace_{index + 1}",
+            )
+            self.menu_ui_buttons.append(button)
+            self.menu_ui_targets[button] = index
 
     def update_viewport(self):
         """Fit the logical GUI into the high-resolution display."""
@@ -3201,6 +3553,12 @@ class Game:
             render_width,
             render_height,
         )
+        # Simulation screens can scale directly into this display-backed view,
+        # avoiding a second full-resolution blit every frame.
+        self._window_viewport_surface = self.window.subsurface(
+            self.viewport_rect
+        )
+        self.window.fill(INK)
 
     def logical_position(self, position):
         """Convert a physical window coordinate into the GUI design grid."""
@@ -3233,20 +3591,121 @@ class Game:
         return translated
 
     def present(self):
-        """Upscale the logical frame without allocating a new surface."""
-        self.window.fill(INK)
+        """Present logical pixels and redraw standstill text natively."""
         viewport_size = self.viewport_rect.size
+        native_ui = self.native_ui_rendering()
+        if not native_ui:
+            pygame.transform.scale(
+                self.screen,
+                viewport_size,
+                self._window_viewport_surface,
+            )
+            pygame.display.flip()
+            return
+
+        self.window.fill(INK)
         if self._present_size != viewport_size:
             self._present_surface = pygame.Surface(viewport_size).convert()
             self._present_size = viewport_size
-        pygame.transform.scale(
+        pygame.transform.smoothscale(
             self.screen, viewport_size, self._present_surface
         )
+        for value, position, font, color, anchor, clip in (
+            self._native_text_commands
+        ):
+            self.draw_native_text(
+                value, position, font, color, anchor, clip
+            )
+        # Compose the entire viewport off-screen before touching the macOS
+        # display surface. Direct alpha-font blits to a Retina backbuffer can
+        # occasionally become solid color rectangles on pygame/SDL.
         self.window.blit(self._present_surface, self.viewport_rect)
         pygame.display.flip()
+        # Keep a complete logical frame for modal background snapshots. This
+        # happens after presentation, so enlarged users only see native text
+        # while the next frame can still copy the workspace.
+        for command in self._native_text_commands:
+            self.draw_logical_text_command(*command)
 
-    def text(self, value, pos, font="body", color=WHITE):
-        self.screen.blit(self.fonts[font].render(str(value), True, color), pos)
+    def native_ui_rendering(self):
+        """Return whether the current screen benefits from native text."""
+        return (
+            getattr(self, "mode", None) in self.native_ui_modes
+            and self.viewport_scale > 1.001
+        )
+
+    def native_font(self, font):
+        """Return a cached font rasterized for the physical viewport."""
+        family, logical_size, bold = self.font_specs[font]
+        physical_size = max(1, round(logical_size * self.viewport_scale))
+        key = (font, physical_size)
+        cached = self._native_font_cache.get(key)
+        if cached is None:
+            cached = pygame.font.SysFont(
+                family, physical_size, bold=bold
+            )
+            self._native_font_cache[key] = cached
+        return cached
+
+    def draw_native_text(
+        self, value, position, font, color, anchor="topleft",
+        clip=None,
+    ):
+        """Draw native-density text into the composited viewport."""
+        rendered = self.native_font(font).render(
+            str(value), True, color
+        )
+        physical_position = (
+            round(float(position[0]) * self.viewport_scale),
+            round(float(position[1]) * self.viewport_scale),
+        )
+        rect = rendered.get_rect()
+        setattr(rect, anchor, physical_position)
+        previous_clip = self._present_surface.get_clip()
+        if clip is not None:
+            self._present_surface.set_clip(pygame.Rect(
+                round(clip.x * self.viewport_scale),
+                round(clip.y * self.viewport_scale),
+                max(1, round(clip.width * self.viewport_scale)),
+                max(1, round(clip.height * self.viewport_scale)),
+            ))
+        self._present_surface.blit(rendered, rect)
+        if clip is not None:
+            self._present_surface.set_clip(previous_clip)
+
+    def draw_logical_text_command(
+        self, value, position, font, color, anchor="topleft",
+        clip=None,
+    ):
+        """Backfill logical text after native presentation for snapshots."""
+        rendered = self.fonts[font].render(str(value), True, color)
+        rect = rendered.get_rect()
+        setattr(rect, anchor, position)
+        previous_clip = self.screen.get_clip()
+        if clip is not None:
+            self.screen.set_clip(clip)
+        self.screen.blit(rendered, rect)
+        if clip is not None:
+            self.screen.set_clip(previous_clip)
+
+    def text(
+        self, value, pos, font="body", color=WHITE,
+        anchor="topleft",
+    ):
+        """Draw logical text or queue a native-density text command."""
+        position = (float(pos[0]), float(pos[1]))
+        clip = self.screen.get_clip()
+        if clip == self.screen.get_rect():
+            clip = None
+        self._native_text_commands.append(
+            (str(value), position, font, color, anchor, clip)
+        )
+        if self.native_ui_rendering():
+            return
+        rendered = self.fonts[font].render(str(value), True, color)
+        rect = rendered.get_rect()
+        setattr(rect, anchor, position)
+        self.screen.blit(rendered, rect)
 
     def draw_app_background(self):
         """Draw a cached gradient-and-grid background for menu-style screens."""
@@ -3306,12 +3765,189 @@ class Game:
             )
         return rect
 
+    def section_heading(
+        self, label, rect, accent=CYAN, detail=""
+    ):
+        """Draw a quiet section divider used by standstill workspaces."""
+        rect = pygame.Rect(rect)
+        pygame.draw.circle(
+            self.screen, accent, (rect.x + 4, rect.centery), 3
+        )
+        self.text(label.upper(), (rect.x + 15, rect.y), "tiny", accent)
+        if detail:
+            self.text(
+                str(detail).upper(),
+                (rect.right, rect.centery),
+                "tiny", MUTED, anchor="midright",
+            )
+        line_start = rect.x + min(
+            175, self.fonts["tiny"].size(label.upper())[0] + 28
+        )
+        if not detail and line_start < rect.right:
+            pygame.draw.line(
+                self.screen, UI_BORDER,
+                (line_start, rect.centery),
+                (rect.right, rect.centery),
+            )
+
+    def control_field(
+        self, rect, label, value, accent=CYAN, arrows=False,
+        disabled=False, active=False, value_font="small",
+    ):
+        """Draw a labeled, hover-aware selector or editable field."""
+        rect = pygame.Rect(rect)
+        mouse = self.logical_mouse_position()
+        hovered = rect.collidepoint(mouse) and not disabled
+        fill = (
+            (10, 22, 22) if disabled else
+            UI_SURFACE_HOVER if hovered or active else UI_SURFACE
+        )
+        border = (
+            (35, 48, 45) if disabled else
+            accent if active else
+            UI_BORDER_BRIGHT if hovered else UI_BORDER
+        )
+        pygame.draw.rect(
+            self.screen, UI_SHADOW, rect.move(0, 3),
+            border_radius=10,
+        )
+        pygame.draw.rect(self.screen, fill, rect, border_radius=10)
+        pygame.draw.rect(
+            self.screen, border, rect, 1, border_radius=10
+        )
+        pygame.draw.rect(
+            self.screen,
+            (50, 64, 60) if disabled else accent,
+            (rect.x, rect.y + 10, 3, max(12, rect.height - 20)),
+            border_radius=2,
+        )
+        if rect.height >= 48:
+            self.text(
+                str(label).upper(), (rect.x + 14, rect.y + 7),
+                "tiny", MUTED if not disabled else (70, 82, 78),
+            )
+            value_y = rect.y + 25
+        else:
+            self.text(
+                str(label).upper(), (rect.x + 13, rect.y + 11),
+                "tiny", MUTED if not disabled else (70, 82, 78),
+            )
+            value_y = rect.y + 10
+        value_color = (
+            (78, 91, 86) if disabled else accent if arrows else WHITE
+        )
+        if rect.height >= 48:
+            self.text(
+                str(value), (rect.x + 14, value_y),
+                value_font, value_color,
+            )
+        else:
+            value_width = self.fonts[value_font].size(str(value))[0]
+            value_x = max(
+                rect.x + 82,
+                rect.right - value_width - 18,
+            )
+            self.text(
+                str(value), (value_x, value_y),
+                value_font, value_color,
+            )
+        if arrows:
+            self.text("‹", (rect.x + 8, rect.centery - 10), "body", accent)
+            self.text(
+                "›", (rect.right - 19, rect.centery - 10),
+                "body", accent,
+            )
+        return hovered
+
+    def compact_stepper(
+        self, label, value, minus_rect, plus_rect, accent=CYAN,
+        label_x=None,
+    ):
+        """Draw one label/value row and its paired decrement controls."""
+        minus_rect = pygame.Rect(minus_rect)
+        plus_rect = pygame.Rect(plus_rect)
+        self.text(
+            str(label).upper(),
+            (
+                minus_rect.x - 94 if label_x is None else label_x,
+                minus_rect.centery - 7,
+            ),
+            "tiny", MUTED,
+        )
+        self.text(
+            str(value),
+            (minus_rect.x - 11, minus_rect.centery),
+            "mono", accent, anchor="midright",
+        )
+        mouse = self.logical_mouse_position()
+        for rect, symbol in ((minus_rect, "−"), (plus_rect, "+")):
+            hovered = rect.collidepoint(mouse)
+            pygame.draw.rect(
+                self.screen,
+                accent if hovered else UI_SURFACE_HOVER,
+                rect,
+                border_radius=7,
+            )
+            pygame.draw.rect(
+                self.screen,
+                accent if hovered else UI_BORDER,
+                rect, 1, border_radius=7,
+            )
+            self.text(
+                symbol, rect.center, "body",
+                INK if hovered else WHITE, anchor="center",
+            )
+
+    def action_button(
+        self, rect, label, accent=CYAN, enabled=True,
+        secondary=False, detail="",
+    ):
+        """Draw a consistent primary or secondary standstill action."""
+        rect = pygame.Rect(rect)
+        hovered = (
+            enabled and rect.collidepoint(self.logical_mouse_position())
+        )
+        if secondary:
+            fill = UI_SURFACE_HOVER if hovered else UI_SURFACE_RAISED
+            border = accent if hovered else UI_BORDER
+            label_color = accent if hovered else MUTED
+        else:
+            fill = (
+                tuple(min(255, channel + 16) for channel in accent)
+                if hovered else accent
+            ) if enabled else (47, 66, 61)
+            border = fill
+            label_color = INK if enabled else MUTED
+        pygame.draw.rect(
+            self.screen, UI_SHADOW, rect.move(0, 4),
+            border_radius=11,
+        )
+        pygame.draw.rect(self.screen, fill, rect, border_radius=11)
+        pygame.draw.rect(
+            self.screen, border, rect, 1, border_radius=11
+        )
+        label_y = rect.centery - (7 if detail else 0)
+        self.text(
+            str(label).upper(), (rect.centerx, label_y),
+            "mono", label_color, anchor="center",
+        )
+        if detail:
+            self.text(
+                str(detail), (rect.centerx, rect.centery + 13),
+                "tiny",
+                MUTED if secondary or not enabled else (26, 72, 62),
+                anchor="center",
+            )
+        return hovered
+
     def draw_fps_counter(self):
         """Draw a compact optional performance counter."""
-        value = self.fonts["mono"].render(
-            f"FPS {self.clock.get_fps():5.1f}", True, CYAN
-        )
-        card = value.get_rect(topright=(CANVAS_W - 14, 14)).inflate(30, 12)
+        label = f"FPS {self.clock.get_fps():5.1f}"
+        value_size = self.fonts["mono"].size(label)
+        card = pygame.Rect(
+            CANVAS_W - 14 - value_size[0],
+            14, value_size[0], value_size[1],
+        ).inflate(30, 12)
         pygame.draw.rect(
             self.screen, UI_SHADOW, card.move(0, 3), border_radius=9
         )
@@ -3324,9 +3960,9 @@ class Game:
         pygame.draw.circle(
             self.screen, CYAN, (card.x + 11, card.centery), 3
         )
-        self.screen.blit(
-            value,
-            value.get_rect(midleft=(card.x + 20, card.centery)),
+        self.text(
+            label, (card.x + 20, card.centery),
+            "mono", CYAN, anchor="midleft",
         )
 
     def camera_transform(self, focus):
@@ -3913,6 +4549,10 @@ class Game:
         self.glass_card(card, accent=CYAN, radius=18)
         self.text(dialog["title"].upper(), (390, 255), "small", CYAN)
         self.text("Name this component", (390, 280), "h2", WHITE)
+        self.text(
+            "Give it a clear name so it is easy to find in selectors.",
+            (390, 308), "small", MUTED,
+        )
         pygame.draw.rect(
             self.screen, (7, 18, 21), field, border_radius=10
         )
@@ -3935,18 +4575,18 @@ class Game:
                 self.screen, YELLOW,
                 (caret_x, field.y + 14), (caret_x, field.y + 43), 2,
             )
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_HOVER, cancel, border_radius=10
-        )
-        pygame.draw.rect(self.screen, CYAN, save, border_radius=10)
-        cancel_text = self.fonts["mono"].render("CANCEL", True, MUTED)
         save_label = "REPLACE" if dialog["replace"] else "SAVE"
-        save_text = self.fonts["mono"].render(save_label, True, INK)
-        self.screen.blit(cancel_text, cancel_text.get_rect(center=cancel.center))
-        self.screen.blit(save_text, save_text.get_rect(center=save.center))
+        self.action_button(
+            cancel, "Cancel", CYAN, True, secondary=True
+        )
+        self.action_button(save, save_label, CYAN)
         helper = dialog["error"] or "Letters, numbers, spaces, hyphens and underscores"
         color = (255, 170, 170) if dialog["error"] else MUTED
         self.text(helper, (390, 397), "small", color)
+        self.text(
+            f"{len(dialog['value'])} CHARACTERS",
+            (field.right, 397), "tiny", MUTED, anchor="topright",
+        )
         self.text("Enter save  •  Esc cancel  •  Ctrl/Cmd+A/C/X/V", (390, 487), "small", MUTED)
 
     def start_race_name_edit(self, entry):
@@ -4270,6 +4910,7 @@ class Game:
         self.race_countdown = 5.0
         self.race_lights_out_flash = 0.0
         self.follow = 0
+        self.race_tower_page = 0
         self.paused = False
         self.event_log = [{
             "time": 0, "type": "start",
@@ -4367,6 +5008,9 @@ class Game:
 
     def menu(self, events):
         self.draw_app_background()
+        if self.menu_ui_manager is not None:
+            for event in events:
+                self.menu_ui_manager.process_events(event)
         pygame.draw.rect(
             self.screen, UI_SURFACE_RAISED,
             (70, 36, 168, 26), border_radius=8,
@@ -4386,8 +5030,11 @@ class Game:
             Button((675, 280, 535, 86), "4  Two-Lap Hotlap", "Choose one AI brain and record its time"),
         ]
         mouse = self.logical_mouse_position()
-        for card in cards:
-            card.draw(self.screen, self.fonts, mouse)
+        if self.menu_ui_manager is None:
+            for card in cards:
+                card.draw(
+                    self.screen, self.fonts, mouse, self.text
+                )
         preview = pygame.Rect(70, 395, 1140, 235)
         self.glass_card(preview, accent=YELLOW, radius=18)
         pygame.draw.rect(
@@ -4427,6 +5074,11 @@ class Game:
             (70, 708), "body", MUTED,
         )
         self.text("ESC quits  •  Number keys open workspaces", (832, 702), "small", MUTED)
+        if self.menu_ui_manager is not None:
+            self.menu_ui_manager.update(
+                max(self.clock.get_time() / 1000.0, 0.001)
+            )
+            self.menu_ui_manager.draw_ui(self.screen)
         for event in events:
             target = None
             if event.type == pygame.KEYDOWN and event.key in (
@@ -4435,7 +5087,16 @@ class Game:
                 target = event.key - pygame.K_1
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 pygame.event.post(pygame.event.Event(pygame.QUIT))
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            elif (
+                self.menu_ui_manager is not None
+                and event.type == pygame_gui.UI_BUTTON_PRESSED
+            ):
+                target = self.menu_ui_targets.get(event.ui_element)
+            if (
+                self.menu_ui_manager is None
+                and event.type == pygame.MOUSEBUTTONDOWN
+                and event.button == 1
+            ):
                 target = next((i for i, c in enumerate(cards) if c.rect.collidepoint(event.pos)), None)
             if target == 0:
                 self.editor_points = [p.copy() for p in self.track.points]
@@ -4516,7 +5177,11 @@ class Game:
         if self.training_generation == "Hybrid":
             docs.append(("overtake: 0 off / 1 deploy", WHITE))
             docs.append((
-                "recharge: 0 off / 1 charge; 70% ICE, +3.5%/s",
+                "recharge: 0 off / 1 charge; 70% ICE, up to +5.5%/s",
+                WHITE,
+            ))
+            docs.append((
+                "recharge gain scales with throttle; 0 throttle = 0 gain",
                 WHITE,
             ))
         docs.extend([
@@ -4533,12 +5198,34 @@ class Game:
         """In-game editor for the restricted, trainable controller language."""
         editor_rect = pygame.Rect(55, 154, 820, 510)
         docs_rect = pygame.Rect(900, 154, 325, 510)
-        docs = self.language_reference_docs()
+        docs = []
+        docs_width = docs_rect.width - 48
+        for raw_line, color in self.language_reference_docs():
+            # Keep the reference readable at the logical resolution. Long
+            # sensor names wrap instead of disappearing behind the scrollbar.
+            words = raw_line.split()
+            wrapped = []
+            current = ""
+            for word in words:
+                candidate = f"{current} {word}".strip()
+                if (
+                    current
+                    and self.fonts["small"].size(candidate)[0] > docs_width
+                ):
+                    wrapped.append(current)
+                    current = f"  {word}"
+                else:
+                    current = candidate
+            wrapped.append(current)
+            docs.extend(
+                (line, color if index == 0 else MUTED)
+                for index, line in enumerate(wrapped)
+            )
         docs_content_rect = pygame.Rect(
             docs_rect.x + 14, docs_rect.y + 47,
             docs_rect.width - 34, docs_rect.height - 61,
         )
-        docs_line_height = 15
+        docs_line_height = 18
         docs_visible_lines = max(
             1, docs_content_rect.height // docs_line_height
         )
@@ -4794,44 +5481,24 @@ class Game:
         self.draw_app_background()
         self.text("CODED CONTROLLER", (55, 28), "small", CYAN)
         self.text("Write the driving algorithm", (55, 52), "title")
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_RAISED, brain_rect, border_radius=9
+        self.control_field(
+            brain_rect, "Base brain",
+            self.training_brain_label()[:27],
+            CYAN, arrows=True,
         )
-        pygame.draw.rect(
-            self.screen, UI_BORDER, brain_rect, 1, border_radius=9
-        )
-        self.text("BASE BRAIN", (brain_rect.x + 12, brain_rect.y + 11), "small", MUTED)
-        self.text(
-            f"‹  {self.training_brain_label()[:27]}  ›",
-            (brain_rect.x + 116, brain_rect.y + 10), "small", CYAN,
-        )
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_RAISED, racecraft_rect, border_radius=9
-        )
-        self.text(
-            "RACECRAFT", (racecraft_rect.x + 10, racecraft_rect.y + 11),
-            "small", MUTED,
-        )
-        self.text(
+        self.control_field(
+            racecraft_rect, "Traffic",
             "ON" if self.training_racecraft else "OFF",
-            (racecraft_rect.x + 112, racecraft_rect.y + 10),
-            "small", CYAN if self.training_racecraft else MUTED,
+            UI_ORANGE if self.training_racecraft else MUTED,
+            active=self.training_racecraft,
         )
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_RAISED, era_rect, border_radius=9
+        self.control_field(
+            era_rect, "Powertrain",
+            self.training_generation.upper(), YELLOW,
         )
-        self.text("POWER", (era_rect.x + 12, era_rect.y + 11), "small", MUTED)
-        self.text(
-            self.training_generation.upper(),
-            (era_rect.x + 78, era_rect.y + 10), "small", YELLOW,
-        )
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_RAISED, track_rect, border_radius=9
-        )
-        self.text("TRACK", (track_rect.x + 12, track_rect.y + 11), "small", MUTED)
-        self.text(
-            f"‹  {self.track_label()[:21]}  ›",
-            (track_rect.x + 72, track_rect.y + 10), "small", CYAN,
+        self.control_field(
+            track_rect, "Circuit", self.track_label()[:21],
+            UI_BLUE, arrows=True,
         )
         pygame.draw.rect(
             self.screen, UI_SHADOW, editor_rect.move(0, 5),
@@ -4906,7 +5573,7 @@ class Game:
                     docs_content_rect.x + 6,
                     docs_content_rect.y + i * docs_line_height,
                 ),
-                "tiny", color,
+                "small", color,
             )
         self.screen.set_clip(None)
         if docs_max_scroll:
@@ -4938,11 +5605,21 @@ class Game:
             pygame.draw.rect(self.screen, (72, 25, 28), (55, 681, 680, 55), border_radius=8)
             self.text(self.algorithm_error[:82], (70, 699), "small", (255, 170, 170))
         else:
-            self.text("Ctrl/Cmd+S save  •  Ctrl/Cmd+Enter train  •  Tab/Shift+Tab indent", (55, 701), "small", MUTED)
-        pygame.draw.rect(self.screen, (18, 38, 31), reload_rect, border_radius=9)
-        self.text("RELOAD FILE", (773, 701), "small", MUTED)
-        pygame.draw.rect(self.screen, CYAN, start_rect, border_radius=9)
-        self.text("VALIDATE & TRAIN", (986, 701), "mono", INK)
+            self.text(
+                (
+                    f"Ln {current_line + 1}, Col {current_col + 1}"
+                    "  •  Ctrl/Cmd+S save  •  Tab/Shift+Tab indent"
+                ),
+                (55, 701), "small", MUTED,
+            )
+        self.action_button(
+            reload_rect, "Reload", CYAN, self.algorithm_path.exists(),
+            secondary=True,
+        )
+        self.action_button(
+            start_rect, "Validate & train", CYAN, True,
+            detail="Ctrl/Cmd + Enter",
+        )
 
     def fit_editor_track(self):
         """Keep authored coordinates in metres; cameras handle screen fitting."""
@@ -5244,21 +5921,21 @@ class Game:
         tool_rects = {}
         for i, (key, _) in enumerate(tools):
             tool_rects[key] = pygame.Rect(x + (i % 2) * 122, 190 + (i // 2) * 46, 114, 37)
-        pit_finish_rect = pygame.Rect(x + 104, 163, 64, 24)
-        delete_rect = pygame.Rect(x + 172, 163, 64, 24)
+        pit_finish_rect = pygame.Rect(x, 374, 114, 30)
+        delete_rect = pygame.Rect(x + 122, 374, 114, 30)
         drs_tool_rects = {
-            "drs_detection": pygame.Rect(x, 371, 76, 28),
-            "drs_entry": pygame.Rect(x + 81, 371, 76, 28),
-            "drs_exit": pygame.Rect(x + 162, 371, 76, 28),
+            "drs_detection": pygame.Rect(x, 414, 76, 28),
+            "drs_entry": pygame.Rect(x + 81, 414, 76, 28),
+            "drs_exit": pygame.Rect(x + 162, 414, 76, 28),
         }
-        minus_border = pygame.Rect(x + 145, 426, 38, 30)
-        plus_border = pygame.Rect(x + 198, 426, 38, 30)
-        minus_road = pygame.Rect(x + 145, 478, 38, 30)
-        plus_road = pygame.Rect(x + 198, 478, 38, 30)
-        selected_road_minus = pygame.Rect(x + 148, 536, 32, 26)
-        selected_road_plus = pygame.Rect(x + 198, 536, 32, 26)
-        selected_grass_minus = pygame.Rect(x + 148, 574, 32, 26)
-        selected_grass_plus = pygame.Rect(x + 198, 574, 32, 26)
+        minus_border = pygame.Rect(x + 145, 466, 38, 28)
+        plus_border = pygame.Rect(x + 198, 466, 38, 28)
+        minus_road = pygame.Rect(x + 145, 503, 38, 28)
+        plus_road = pygame.Rect(x + 198, 503, 38, 28)
+        selected_road_minus = pygame.Rect(x + 148, 575, 32, 26)
+        selected_road_plus = pygame.Rect(x + 198, 575, 32, 26)
+        selected_grass_minus = pygame.Rect(x + 148, 611, 32, 26)
+        selected_grass_plus = pygame.Rect(x + 198, 611, 32, 26)
 
         for event in events:
             if (
@@ -5765,10 +6442,10 @@ class Game:
             coordinate_text = (
                 f"X {mouse_world.x:.1f} m   Y {mouse_world.y:.1f} m"
             )
-            coordinate_surface = self.fonts["tiny"].render(
-                coordinate_text, True, WHITE
+            coordinate_size = self.fonts["tiny"].size(coordinate_text)
+            coordinate_rect = pygame.Rect(
+                0, 0, coordinate_size[0], coordinate_size[1]
             )
-            coordinate_rect = coordinate_surface.get_rect()
             coordinate_rect.topleft = (
                 editor_mouse.x + 14, editor_mouse.y + 14
             )
@@ -5784,25 +6461,19 @@ class Game:
                 self.screen, (64, 135, 108), coordinate_rect, 1,
                 border_radius=6,
             )
-            self.screen.blit(
-                coordinate_surface,
-                coordinate_surface.get_rect(center=coordinate_rect.center),
+            self.text(
+                coordinate_text, coordinate_rect.center,
+                "tiny", WHITE, anchor="center",
             )
         self.screen.set_clip(None)
 
         self.panel("Track Studio", f"World editor • {temp.lap_length_m / 1000:.3f} km" if temp else "World editor")
         self.pill("Points", f"{len(self.editor_points)} / 8", x, 108, 112, YELLOW)
         self.pill("Zoom", f"{self.editor_zoom:.2f}x", x + 122, 108, 114)
-        self.text(
-            (
-                f"CURSOR  X {mouse_world.x:.1f} m  •  Y {mouse_world.y:.1f} m"
-                if mouse_world is not None
-                else "CURSOR  Move onto map"
-            ),
-            (x, 147), "tiny",
-            CYAN if mouse_world is not None else MUTED,
+        self.section_heading(
+            "Authoring tools", (x, 169, 236, 16),
+            CYAN, self.editor_tool.replace("_", " "),
         )
-        self.text("AUTHORING TOOL", (x, 169), "small", MUTED)
         pit_finish_active = self.editor_tool == "pit_finish"
         pit_finish_available = bool(self.editor_pitlane_points)
         pygame.draw.rect(
@@ -5818,8 +6489,8 @@ class Game:
             pit_finish_rect, 1, border_radius=6,
         )
         self.text(
-            "0 PIT SF", (pit_finish_rect.x + 8, pit_finish_rect.y + 5),
-            "tiny",
+            "0  PIT TIMING",
+            (pit_finish_rect.x + 13, pit_finish_rect.y + 8), "tiny",
             WHITE if pit_finish_active else
             MUTED if pit_finish_available else (73, 82, 78),
         )
@@ -5834,7 +6505,7 @@ class Game:
             delete_rect, 1, border_radius=6,
         )
         self.text(
-            "9 DEL", (delete_rect.x + 15, delete_rect.y + 5), "tiny",
+            "9  DELETE", (delete_rect.x + 26, delete_rect.y + 8), "tiny",
             WHITE if delete_active else MUTED,
         )
         for key, label in tools:
@@ -5883,21 +6554,26 @@ class Game:
                 drs_labels[key], (rect.x + 8, rect.y + 7), "tiny",
                 WHITE if active else MUTED,
             )
-        self.text("BORDER DISTANCE", (x, 406), "small", MUTED)
-        self.text(f"{int(self.editor_features.get('border_margin', BORDER_W))} m", (x, 433), "mono", YELLOW)
-        for rect, symbol in ((minus_border, "−"), (plus_border, "+")):
-            pygame.draw.rect(self.screen, (28, 51, 43), rect, border_radius=5)
-            self.text(symbol, (rect.x + 12, rect.y + 4), "body", WHITE)
-        self.text("ALL-NODE WIDTH", (x, 458), "small", MUTED)
-        self.text(f"{self.editor_road_width:.1f} m", (x, 485), "mono", YELLOW)
-        for rect, symbol in ((minus_road, "−"), (plus_road, "+")):
-            pygame.draw.rect(self.screen, (28, 51, 43), rect, border_radius=5)
-            self.text(symbol, (rect.x + 12, rect.y + 4), "body", WHITE)
-        pygame.draw.rect(
-            self.screen, (14, 28, 23), (x, 510, 236, 132),
-            border_radius=8,
+        self.section_heading(
+            "Global geometry", (x, 449, 236, 16), YELLOW
         )
-        self.text("SELECTED NODE", (x + 12, 520), "small", CYAN)
+        self.compact_stepper(
+            "Grass",
+            f"{int(self.editor_features.get('border_margin', BORDER_W))}m",
+            minus_border, plus_border, YELLOW, label_x=x + 12,
+        )
+        self.compact_stepper(
+            "Road", f"{self.editor_road_width:.1f}m",
+            minus_road, plus_road, YELLOW, label_x=x + 12,
+        )
+        pygame.draw.rect(
+            self.screen, (14, 28, 23), (x, 543, 236, 121),
+            border_radius=10,
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER, (x, 543, 236, 121), 1,
+            border_radius=10,
+        )
         selected_index = self.editor_selected_index
         selected_kind = self.editor_selected_kind
         if selected_kind == "route" and selected_index is not None:
@@ -5909,31 +6585,46 @@ class Game:
             selected_road = self.editor_pitlane_widths[selected_index]
             selected_grass = self.editor_pitlane_grass_widths[selected_index]
         else:
-            selected_label = "RIGHT-CLICK A NODE"
+            selected_label = "NONE"
             selected_road = None
             selected_grass = None
-        self.text(selected_label, (x + 12, 539), "tiny", YELLOW)
+        self.section_heading(
+            "Selected node", (x + 12, 555, 212, 16),
+            CYAN, selected_label,
+        )
         self.text(
             f"Road  {selected_road:.1f} m"
             if selected_road is not None else "Road  —",
-            (x + 12, 559), "small", WHITE,
+            (x + 12, 582), "small", WHITE,
         )
         self.text(
             f"Grass {selected_grass:.1f} m"
             if selected_grass is not None else "Grass —",
-            (x + 12, 597), "small", WHITE,
+            (x + 12, 618), "small", WHITE,
         )
+        mouse = self.logical_mouse_position()
         for rect, symbol in (
             (selected_road_minus, "−"), (selected_road_plus, "+"),
             (selected_grass_minus, "−"), (selected_grass_plus, "+"),
         ):
+            hovered = rect.collidepoint(mouse)
             pygame.draw.rect(
-                self.screen, (28, 51, 43), rect, border_radius=5
+                self.screen,
+                CYAN if hovered else (28, 51, 43),
+                rect, border_radius=6,
             )
-            self.text(symbol, (rect.x + 10, rect.y + 1), "body", WHITE)
+            pygame.draw.rect(
+                self.screen,
+                CYAN if hovered else UI_BORDER,
+                rect, 1, border_radius=6,
+            )
+            self.text(
+                symbol, rect.center, "body",
+                INK if hovered else WHITE, anchor="center",
+            )
         self.text(
             "Right-drag moves • +/- changes width",
-            (x + 12, 625), "tiny", MUTED,
+            (x + 12, 646), "tiny", MUTED,
         )
         self.footer_hint((
             "[Esc] Paddock  •  [0] Pit line  •  [9] Delete",
@@ -6062,6 +6753,19 @@ class Game:
             int(round(clamp(car.brake_input, 0.0, 1.0) * 100)),
         )
 
+    @staticmethod
+    def training_hybrid_energy_state(car):
+        """Return the live Hybrid mode and electrical deployment percentage."""
+        if car.recharge_active:
+            return "RECHARGE", "CHARGING", (77, 171, 247), 0
+        if car.battery_regen > 0.001:
+            return "REGEN", "HARVEST", (77, 171, 247), 0
+        if car.drs_active:
+            return "M.O.M.", "+30% ELEC", (34, 197, 94), 30
+        if car.overtake_active:
+            return "DEPLOY", "+20% ELEC", YELLOW, 20
+        return "READY", "0% ELEC", MUTED, 0
+
     def training(self, events, dt):
         minus_rect = pygame.Rect(CANVAS_W + 143, 130, 24, 24)
         plus_rect = pygame.Rect(CANVAS_W + 218, 130, 24, 24)
@@ -6166,24 +6870,78 @@ class Game:
         progress = clamp(self.session_time / self.training_duration, 0, 1)
         pygame.draw.rect(self.screen, (39, 57, 50), (x + 11, 204, 218, 3), border_radius=2)
         pygame.draw.rect(self.screen, CYAN, (x + 11, 204, int(218 * progress), 3), border_radius=2)
-        energy = (
-            f" • BAT {champion.battery:3.0f}%"
-            if champion.generation == "Hybrid" else " • FULL ICE POWER"
-        )
-        self.text(
-            f"{self.track.name[:20]}{energy}",
-            (x, 220), "small", CYAN,
-        )
+        hybrid_training = champion.generation == "Hybrid"
+        telemetry_shift = 27 if hybrid_training else 0
+        if hybrid_training:
+            energy_card = pygame.Rect(x, 217, 240, 47)
+            pygame.draw.rect(
+                self.screen, (14, 28, 23), energy_card,
+                border_radius=7,
+            )
+            mode, detail, mode_color, deployment_percent = (
+                self.training_hybrid_energy_state(champion)
+            )
+            battery_ratio = clamp(champion.battery / 100.0, 0.0, 1.0)
+            battery_color = (
+                RED if battery_ratio < 0.25
+                else YELLOW if battery_ratio < 0.50
+                else CYAN
+            )
+            self.text("BATTERY", (x + 8, 222), "tiny", MUTED)
+            self.text(
+                f"{champion.battery:3.0f}%",
+                (x + 96, 221), "small", battery_color,
+            )
+            battery_bar = pygame.Rect(x + 8, 246, 136, 8)
+            pygame.draw.rect(
+                self.screen, (38, 52, 47), battery_bar,
+                border_radius=4,
+            )
+            if battery_ratio > 0:
+                pygame.draw.rect(
+                    self.screen, battery_color,
+                    (
+                        battery_bar.x, battery_bar.y,
+                        max(2, round(battery_bar.width * battery_ratio)),
+                        battery_bar.height,
+                    ),
+                    border_radius=4,
+                )
+            mode_card = pygame.Rect(x + 152, 222, 80, 34)
+            pygame.draw.rect(
+                self.screen,
+                tuple(round(channel * 0.22) for channel in mode_color),
+                mode_card, border_radius=6,
+            )
+            pygame.draw.rect(
+                self.screen, mode_color, mode_card, 1,
+                border_radius=6,
+            )
+            self.text(
+                mode, (mode_card.centerx, mode_card.y + 3),
+                "tiny", mode_color, anchor="midtop",
+            )
+            self.text(
+                detail, (mode_card.centerx, mode_card.y + 18),
+                "tiny", WHITE if deployment_percent else mode_color,
+                anchor="midtop",
+            )
+        else:
+            self.text(
+                f"{self.track.name[:20]} • FULL ICE POWER",
+                (x, 220), "small", CYAN,
+            )
         self.text(
             f"{champion.speed_kph:3.0f} KM/H  •  G{champion.gear}/8"
             f"  •  {champion.rpm:05.0f} RPM",
-            (x, 243), "small", YELLOW,
+            (x, 243 + telemetry_shift), "small", YELLOW,
         )
         throttle_percent, brake_percent = (
             self.training_control_percentages(champion)
         )
+        control_y = 264 + telemetry_shift
         pygame.draw.rect(
-            self.screen, (14, 28, 23), (x, 264, 240, 42),
+            self.screen, (14, 28, 23), (x, control_y, 240, 42),
             border_radius=7,
         )
         for column, label, value, color in (
@@ -6193,17 +6951,20 @@ class Game:
             control_x = x + 8 + column * 116
             self.text(
                 f"{label} {value:3d}%",
-                (control_x, 269), "tiny",
+                (control_x, control_y + 5), "tiny",
                 color if value else MUTED,
             )
             pygame.draw.rect(
                 self.screen, (38, 52, 47),
-                (control_x, 290, 106, 7), border_radius=4,
+                (control_x, control_y + 26, 106, 7), border_radius=4,
             )
             if value:
                 pygame.draw.rect(
                     self.screen, color,
-                    (control_x, 290, max(2, round(106 * value / 100)), 7),
+                    (
+                        control_x, control_y + 26,
+                        max(2, round(106 * value / 100)), 7,
+                    ),
                     border_radius=4,
                 )
 
@@ -6211,8 +6972,9 @@ class Game:
         # the live steering command grows left or right from that marker.
         steering_value = clamp(champion.steering_input, -1.0, 1.0)
         steering_percent = int(round(steering_value * 100))
-        steering_card = pygame.Rect(x, 310, 240, 39)
-        steering_bar = pygame.Rect(x + 8, 333, 224, 8)
+        steering_y = 310 + telemetry_shift
+        steering_card = pygame.Rect(x, steering_y, 240, 39)
+        steering_bar = pygame.Rect(x + 8, steering_y + 23, 224, 8)
         steering_centre = steering_bar.centerx
         steering_width = round(
             steering_bar.width / 2 * abs(steering_value)
@@ -6220,8 +6982,8 @@ class Game:
         pygame.draw.rect(
             self.screen, (14, 28, 23), steering_card, border_radius=7
         )
-        self.text("L", (x + 8, 314), "tiny", MUTED)
-        self.text("R", (x + 224, 314), "tiny", MUTED)
+        self.text("L", (x + 8, steering_y + 4), "tiny", MUTED)
+        self.text("R", (x + 224, steering_y + 4), "tiny", MUTED)
         steering_label = self.fonts["tiny"].render(
             f"STEERING {steering_percent:+4d}%",
             True,
@@ -6229,7 +6991,7 @@ class Game:
         )
         self.screen.blit(
             steering_label,
-            steering_label.get_rect(center=(x + 120, 320)),
+            steering_label.get_rect(center=(x + 120, steering_y + 10)),
         )
         pygame.draw.rect(
             self.screen, (38, 52, 47), steering_bar, border_radius=4
@@ -6258,10 +7020,12 @@ class Game:
         )
         self.text(
             "RK / DRIVER      OVT  FITNESS  KM/H G",
-            (x, 355), "tiny", MUTED,
+            (x, 355 + telemetry_shift), "tiny", MUTED,
         )
+        ranking_y = 370 + telemetry_shift
+        ranking_spacing = 23 if hybrid_training else 24
         for i, car in enumerate(ranked[:10]):
-            y = 370 + i * 24
+            y = ranking_y + i * ranking_spacing
             selected = car is champion
             pygame.draw.rect(
                 self.screen,
@@ -6771,66 +7535,73 @@ class Game:
         preview = pygame.Rect(55, 165, 740, 500)
         self.glass_card(preview, accent=YELLOW, radius=18)
         self.track.draw_preview(self.screen, preview.inflate(-40, -40))
+        pygame.draw.rect(
+            self.screen, (9, 21, 22),
+            (preview.x + 22, preview.y + 20, 310, 82),
+            border_radius=12,
+        )
         self.text(self.track.name, (82, 190), "h2", YELLOW)
         self.text(
-            f"{self.track.lap_length_m / 1000:.3f} km  •  2 laps",
+            f"{self.track.lap_length_m / 1000:.3f} km  •  2 timed laps",
             (84, 224), "small", WHITE,
+        )
+        self.text(
+            "LIVE CIRCUIT PREVIEW", (preview.x + 24, preview.bottom - 39),
+            "tiny", MUTED,
         )
         self.glass_card(
             pygame.Rect(825, 165, 410, 500),
             accent=CYAN,
             radius=18,
         )
-        self.text("CIRCUIT", (850, 185), "small", MUTED)
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_HOVER, track_rect, border_radius=10
+        self.section_heading(
+            "Run configuration", (850, 184, 360, 16),
+            CYAN, "3 choices",
         )
-        pygame.draw.rect(
-            self.screen, UI_BORDER, track_rect, 1, border_radius=10
-        )
-        self.text(
-            f"‹  {self.track_label()[:26]}  ›",
-            (track_rect.x + 18, track_rect.y + 14), "mono", CYAN,
-        )
-        self.text("AI BRAIN", (850, 270), "small", MUTED)
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_HOVER, brain_rect, border_radius=10
-        )
-        pygame.draw.rect(
-            self.screen, UI_BORDER, brain_rect, 1, border_radius=10
+        self.control_field(
+            track_rect, "01  Circuit", self.track_label()[:26],
+            YELLOW, arrows=True, value_font="mono",
         )
         self.text(
+            "02  AI BRAIN", (850, 283), "tiny", MUTED,
+        )
+        self.control_field(
+            brain_rect, "Controller source",
             self.brain_label(self.hotlap_brain)[:30],
-            (brain_rect.x + 18, brain_rect.y + 18), "mono", WHITE,
+            CYAN, value_font="mono",
         )
         for rect, label in ((previous_rect, "‹"), (next_rect, "›")):
+            hovered = rect.collidepoint(self.logical_mouse_position())
             pygame.draw.rect(
-                self.screen, UI_SURFACE_HOVER, rect, border_radius=9
+                self.screen, CYAN if hovered else UI_SURFACE_HOVER,
+                rect, border_radius=9,
             )
-            rendered = self.fonts["h2"].render(label, True, CYAN)
-            self.screen.blit(rendered, rendered.get_rect(center=rect.center))
+            pygame.draw.rect(
+                self.screen, CYAN if hovered else UI_BORDER,
+                rect, 1, border_radius=9,
+            )
+            self.text(
+                label, rect.center, "h2",
+                INK if hovered else CYAN, anchor="center",
+            )
         self.text(
             f"{len(self.brain_choices())} selectable brain source(s)",
-            (1030, 398), "small", MUTED,
+            (1032, 398), "tiny", MUTED,
         )
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_HOVER, era_rect, border_radius=10
+        self.control_field(
+            era_rect, "03  Powertrain",
+            self.hotlap_generation.upper(), YELLOW, arrows=True,
         )
-        self.text("POWERTRAIN", (era_rect.x + 16, era_rect.y + 13), "small", MUTED)
+        self.action_button(
+            start_rect, "Start two-lap run", CYAN, True,
+            detail="Enter / Space",
+        )
         self.text(
-            f"‹  {self.hotlap_generation.upper()}  ›",
-            (era_rect.x + 205, era_rect.y + 12), "small", YELLOW,
+            "FIXED CONDITIONS", (850, 598), "tiny", CYAN,
         )
-        pygame.draw.rect(
-            self.screen, UI_SHADOW, start_rect.move(0, 5),
-            border_radius=11,
-        )
-        pygame.draw.rect(self.screen, CYAN, start_rect, border_radius=11)
-        label = self.fonts["mono"].render("START TWO-LAP RUN", True, INK)
-        self.screen.blit(label, label.get_rect(center=start_rect.center))
         self.text(
-            "Soft tyres • 20 kg fuel • dry circuit",
-            (850, 595), "small", MUTED,
+            "Soft tyres  •  20 kg fuel  •  dry circuit",
+            (850, 619), "small", WHITE,
         )
         self.text(
             "[Esc] Back  •  Click circuit  •  [←/→] Choose brain",
@@ -7159,21 +7930,14 @@ class Game:
             "Click to configure • double-click a driver to rename",
             (55, 112), "body", MUTED,
         )
-        pygame.draw.rect(
-            self.screen, UI_SURFACE_RAISED,
-            setup["track"], border_radius=9,
+        self.control_field(
+            setup["track"], "Circuit", self.track_label()[:25],
+            UI_BLUE, arrows=True,
         )
-        pygame.draw.rect(
-            self.screen, UI_BORDER,
-            setup["track"], 1, border_radius=9,
+        self.section_heading(
+            "Starting grid", (52, 142, 678, 16),
+            YELLOW, f"{count} cars",
         )
-        self.text("CIRCUIT", (setup["track"].x + 14, setup["track"].y + 11), "small", MUTED)
-        self.text(
-            f"‹  {self.track_label()[:25]}  ›",
-            (setup["track"].x + 105, setup["track"].y + 10), "small", CYAN,
-        )
-        self.text("CLICK TO CHANGE", (setup["track"].right - 127, setup["track"].y + 11), "small", MUTED)
-        self.text("STARTING GRID", (52, 145), "small", YELLOW)
         for i, rect in enumerate(roster_rects):
             entry = self.race_entries[i]
             selected = i == self.selected_entry
@@ -7206,30 +7970,61 @@ class Game:
             accent=CYAN,
             radius=16,
         )
-        self.text("SESSION", (800, 151), "small", YELLOW)
-        for label, y, value, minus, plus in (
-            ("CARS", 168, str(self.race_settings["cars"]), "cars_minus", "cars_plus"),
-            ("LAPS", 219, str(self.race_settings["laps"]), "laps_minus", "laps_plus"),
+        self.section_heading(
+            "Session", (800, 151, 400, 16), CYAN,
+            "Race rules",
+        )
+        for label, value, minus, plus in (
+            (
+                "Cars", str(self.race_settings["cars"]),
+                "cars_minus", "cars_plus",
+            ),
+            (
+                "Laps", str(self.race_settings["laps"]),
+                "laps_minus", "laps_plus",
+            ),
         ):
-            self.text(label, (800, y), "small", MUTED)
-            for key, symbol in ((minus, "−"), (plus, "+")):
-                pygame.draw.rect(self.screen, (31, 55, 46), setup[key], border_radius=5)
-                self.text(symbol, (setup[key].x + 10, setup[key].y + 4), "body", WHITE)
-            self.text(value, (973, y - 1), "mono", WHITE)
-        for label, key, y in (
-            ("WEATHER", "weather", 253), ("ERA", "generation", 303), ("TEAMS", "teams", 353),
+            self.compact_stepper(
+                label, value, setup[minus], setup[plus], CYAN
+            )
+        for label, key, accent in (
+            ("Weather", "weather", UI_BLUE),
+            ("Power", "generation", YELLOW),
+            ("Teams", "teams", UI_VIOLET),
         ):
-            self.text(label, (800, y + 11), "small", MUTED)
-            pygame.draw.rect(self.screen, (27, 52, 43), setup[key], border_radius=6)
             value = self.race_settings[key]
             if isinstance(value, bool):
                 value = "PAIRED" if value else "INDIVIDUAL"
-            self.text(value.upper(), (setup[key].x + 13, setup[key].y + 10), "small", CYAN)
+            self.control_field(
+                setup[key], label, value.upper(), accent,
+            )
 
         entry = self.race_entries[self.selected_entry]
-        self.text(f"CAR {self.selected_entry + 1:02} CONFIGURATION", (775, 427), "small", YELLOW)
+        self.glass_card(
+            pygame.Rect(775, 418, 450, 246),
+            accent=COLORS[entry["color"]],
+            radius=16,
+        )
+        self.section_heading(
+            f"Car {self.selected_entry + 1:02} configuration",
+            (800, 428, 400, 16),
+            COLORS[entry["color"]], "Selected entry",
+        )
         for key in ("name", "team_name", "tyre", "color"):
-            pygame.draw.rect(self.screen, (15, 31, 26), setup[key], border_radius=6)
+            pygame.draw.rect(
+                self.screen,
+                UI_SURFACE_HOVER
+                if setup[key].collidepoint(self.logical_mouse_position())
+                else (10, 24, 23),
+                setup[key], border_radius=7,
+            )
+            pygame.draw.rect(
+                self.screen,
+                UI_BORDER_BRIGHT
+                if setup[key].collidepoint(self.logical_mouse_position())
+                else UI_BORDER,
+                setup[key], 1, border_radius=7,
+            )
         name_editing = (
             self.editing_name == "driver"
             and self.race_name_target is entry
@@ -7272,8 +8067,8 @@ class Game:
             )
         self.text(
             "ENTER CONFIRMS • ESC CANCELS"
-            if name_editing else "CLICK NAME TO RENAME",
-            (setup["name"].x + 3, 488), "small",
+            if name_editing else "CLICK DRIVER NAME TO RENAME",
+            (setup["name"].x + 3, 488), "tiny",
             CYAN if name_editing else MUTED,
         )
         team_value = self.team_names[self.selected_entry // 2] if self.race_settings["teams"] else "NO TEAM"
@@ -7284,22 +8079,26 @@ class Game:
             pygame.draw.rect(self.screen, (31, 55, 46), setup[key], border_radius=5)
             self.text(symbol, (setup[key].x + 10, setup[key].y + 5), "body", WHITE)
         pygame.draw.rect(self.screen, COLORS[entry["color"]], (setup["color"].x + 10, setup["color"].y + 9, 110, 20), border_radius=5)
-        self.text("PIT: CONTROLLER CODE", (808, 573), "small", CYAN)
+        self.text("PIT STRATEGY: CONTROLLER CODE", (808, 573), "tiny", CYAN)
         for key, label in (("grid_up", "GRID UP"), ("grid_down", "GRID DOWN")):
-            pygame.draw.rect(self.screen, (23, 44, 37), setup[key], border_radius=6)
-            self.text(label, (setup[key].x + 15, setup[key].y + 11), "small", MUTED)
-        pygame.draw.rect(self.screen, (15, 31, 26), setup["brain"], border_radius=6)
-        self.text("AI BRAIN", (setup["brain"].x + 12, setup["brain"].y + 11), "small", MUTED)
-        self.text(
-            self.brain_label(entry.get("brain", "__session__"))[:25],
-            (setup["brain"].x + 105, setup["brain"].y + 10),
-            "small", CYAN,
+            self.action_button(
+                setup[key], label, CYAN, True, secondary=True,
+            )
+        self.control_field(
+            setup["brain"], "AI brain",
+            self.brain_label(
+                entry.get("brain", "__session__")
+            )[:25],
+            CYAN, arrows=True,
         )
-        self.text("CLICK TO CHANGE", (setup["brain"].right - 125, setup["brain"].y + 11), "small", MUTED)
 
         trained = bool(list(BRAIN_DIR.glob("*.json"))) or self.generation > 0
-        pygame.draw.rect(self.screen, CYAN if trained else (56, 76, 69), setup["start"], border_radius=9)
-        self.text("START RACE" if trained else "TRAINED AI REQUIRED", (978 if trained else 962, 694), "mono", INK if trained else MUTED)
+        self.action_button(
+            setup["start"],
+            "Start race" if trained else "Trained AI required",
+            CYAN, trained,
+            detail="5-light start sequence" if trained else "",
+        )
         self.text("[Esc] Back to paddock", (52, 704), "small", MUTED)
 
     def race(self, events, dt):
@@ -7311,6 +8110,14 @@ class Game:
                     self.mode = "menu"
                 elif event.key == pygame.K_SPACE:
                     self.paused = not self.paused
+                elif event.key in (pygame.K_UP, pygame.K_DOWN):
+                    ranked = sorted(
+                        self.cars, key=self.race_order_key, reverse=True
+                    )
+                    self.change_race_focus(
+                        ranked,
+                        -1 if event.key == pygame.K_UP else 1,
+                    )
                 elif event.key in (pygame.K_LEFT, pygame.K_RIGHT):
                     self.metric = (
                         self.metric
@@ -7344,11 +8151,20 @@ class Game:
                     ranked = sorted(
                         self.cars, key=self.race_order_key, reverse=True
                     )
+                    page, page_start, page_end = (
+                        self.race_tower_page_bounds(
+                            len(ranked),
+                            getattr(self, "race_tower_page", 0),
+                        )
+                    )
+                    self.race_tower_page = page
                     row = self.race_tower_row(
-                        event.pos[1], len(ranked)
+                        event.pos[1], page_end - page_start
                     )
                     if row is not None:
-                        self.follow = self.cars.index(ranked[row])
+                        self.follow = self.cars.index(
+                            ranked[page_start + row]
+                        )
                         self.event_camera = False
         if not self.paused and self.advance_race_countdown(dt):
             pass
@@ -7440,6 +8256,7 @@ class Game:
         ]
         if self.cars[self.follow].removed_from_track and visible_cars:
             self.follow = self.cars.index(visible_cars[0])
+        self.sync_race_tower_page(ranked)
         focused_car = self.cars[self.follow]
         camera_offset, camera_scale = self.camera_transform(focused_car.position)
         self.track.draw(self.screen, camera_offset, camera_scale)
@@ -7628,6 +8445,61 @@ class Game:
         row = int((float(mouse_y) - 190.0) // 48.0)
         return row if 0 <= row < min(10, car_count) else None
 
+    @staticmethod
+    def race_tower_page_bounds(car_count, page):
+        """Clamp a timetable page and return its ranked slice."""
+        car_count = max(0, int(car_count))
+        maximum_page = max(0, (car_count - 1) // 10)
+        page = int(clamp(int(page), 0, maximum_page))
+        start = page * 10
+        return page, start, min(start + 10, car_count)
+
+    def sync_race_tower_page(self, ranked):
+        """Keep the ten-driver timetable page attached to the focused car."""
+        if not ranked or not self.cars:
+            self.race_tower_page = 0
+            return
+        followed = (
+            self.cars[self.follow]
+            if 0 <= self.follow < len(self.cars)
+            else ranked[0]
+        )
+        rank_index = next(
+            (
+                index for index, car in enumerate(ranked)
+                if car is followed
+            ),
+            0,
+        )
+        self.race_tower_page = rank_index // 10
+
+    def change_race_focus(self, ranked, direction):
+        """Move the manual camera to the adjacent classified driver."""
+        if not ranked or not self.cars:
+            return
+        followed = (
+            self.cars[self.follow]
+            if 0 <= self.follow < len(self.cars)
+            else ranked[0]
+        )
+        rank_index = next(
+            (
+                index for index, car in enumerate(ranked)
+                if car is followed
+            ),
+            0,
+        )
+        rank_index = int(clamp(
+            rank_index + int(direction), 0, len(ranked) - 1
+        ))
+        selected = ranked[rank_index]
+        self.follow = next(
+            index for index, car in enumerate(self.cars)
+            if car is selected
+        )
+        self.race_tower_page = rank_index // 10
+        self.event_camera = False
+
     def draw_checkered_border(self, rect, square=5):
         """Draw a compact chequered classification border around a row."""
         colors = (WHITE, (35, 40, 42))
@@ -7654,6 +8526,14 @@ class Game:
         self.panel("Race Control", f"{self.flag_state}  •  {camera_label}")
         self.text(f"LAP {min(max(c.lap for c in self.cars)+1, self.target_laps)} / {self.target_laps}", (x + 20, 101), "h2")
         self.text(f"{self.session_time:07.2f}", (x + 178, 108), "mono", YELLOW)
+        page, page_start, page_end = self.race_tower_page_bounds(
+            len(ranked), getattr(self, "race_tower_page", 0)
+        )
+        self.race_tower_page = page
+        self.text(
+            f"POSITIONS {page_start + 1}–{page_end}",
+            (x + 20, 128), "tiny", MUTED,
+        )
         labels = (
             "INTERVAL (SECONDS)", "GAP TO LEADER (SECONDS)", "TYRE / AGE",
             "PIT STOPS", "CONDITION", "BATTERY / ENERGY MODE",
@@ -7672,8 +8552,9 @@ class Game:
         metric_text = self.fonts["small"].render(f"‹   {labels[self.metric]}   ›", True, CYAN)
         self.screen.blit(metric_text, metric_text.get_rect(center=(x + PANEL // 2, 160)))
         leader = ranked[0]
-        for i, car in enumerate(ranked[:10]):
-            y = 190 + i * 48
+        for row, car in enumerate(ranked[page_start:page_end]):
+            rank_index = page_start + row
+            y = 190 + row * 48
             focused = self.cars.index(car) == self.follow
             dnf = (
                 car.finish_time is None
@@ -7701,7 +8582,7 @@ class Game:
             row_color = (125, 129, 131) if dnf else car.color
             pygame.draw.rect(self.screen, row_color, (x + 15, y + 7, 5, 27), border_radius=2)
             self.text(
-                f"{i+1:>2}", (x + 27, y + 10), "mono",
+                f"{rank_index+1:>2}", (x + 27, y + 10), "mono",
                 (145, 149, 151) if dnf else WHITE if focused else MUTED,
             )
             self.text(
@@ -7713,16 +8594,19 @@ class Game:
                 CYAN if focused else MUTED
             )
             if self.metric == 0:
-                previous = ranked[i - 1] if i else leader
+                previous = (
+                    ranked[rank_index - 1]
+                    if rank_index else leader
+                )
                 value = (
-                    "LEADER" if i == 0
+                    "LEADER" if rank_index == 0
                     else self.format_race_gap(
                         self.race_gap_seconds(previous, car)
                     )
                 )
             elif self.metric == 1:
                 value = (
-                    "LEADER" if i == 0
+                    "LEADER" if rank_index == 0
                     else self.format_race_gap(
                         self.race_gap_seconds(leader, car)
                     )
@@ -7795,8 +8679,14 @@ class Game:
                 value, (x + 148, y + 22), "small", value_color
             )
         if len(ranked) > 10:
-            self.text(f"+ {len(ranked)-10} MORE CARS", (x + 20, 675), "small", MUTED)
-        self.footer_hint(("[←/→] Metric  •  Wheel/[ ] Zoom", "[Y/C/W/P] Events  •  [Esc] Back"))
+            self.text(
+                f"PAGE {page + 1}/{(len(ranked) - 1) // 10 + 1}",
+                (x + 20, 675), "small", MUTED,
+            )
+        self.footer_hint((
+            "UP/DOWN Driver  •  LEFT/RIGHT Data",
+            "Wheel/[ ] Zoom  •  [Esc] Back",
+        ))
 
     def draw_results(self, ranked):
         self.draw_app_background()
@@ -7885,6 +8775,7 @@ class Game:
         running = True
         while running:
             dt = self.clock.tick(FPS)
+            self._native_text_commands.clear()
             raw_events = pygame.event.get()
             for event in raw_events:
                 if event.type == pygame.QUIT:
@@ -7920,10 +8811,12 @@ class Game:
             if self.show_fps:
                 self.draw_fps_counter()
             if pygame.time.get_ticks() < self.message_until:
-                box = self.fonts["body"].render(self.message, True, INK)
-                rect = box.get_rect(
-                    center=(WIDTH // 2, HEIGHT - 35)
-                ).inflate(38, 18)
+                message_size = self.fonts["body"].size(self.message)
+                rect = pygame.Rect(
+                    0, 0, message_size[0], message_size[1]
+                )
+                rect.center = (WIDTH // 2, HEIGHT - 35)
+                rect.inflate_ip(38, 18)
                 pygame.draw.rect(
                     self.screen, UI_SHADOW, rect.move(0, 4),
                     border_radius=11,
@@ -7931,7 +8824,10 @@ class Game:
                 pygame.draw.rect(
                     self.screen, YELLOW, rect, border_radius=11
                 )
-                self.screen.blit(box, box.get_rect(center=rect.center))
+                self.text(
+                    self.message, rect.center, "body", INK,
+                    anchor="center",
+                )
             self.present()
         pygame.quit()
 
