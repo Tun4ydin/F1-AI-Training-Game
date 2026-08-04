@@ -1,29 +1,32 @@
-# Formula AI ICE Controller — Agile Waypoint v2
-# Full ICE power with predictive cornering, slide control and racecraft.
+# Formula AI ICE Controller — Agile Waypoint v8 (Anti-Pileup Edition)
+# Full ICE power with predictive cornering, out-in-out track usage,
+# slip-seeking throttle control, slide control and racecraft.
 # All continuous driving inputs used below are normalized.
 
 # Trainable steering and stability parameters.
 waypoint_gain      = parameter(0.92, 0.35, 1.60)
 heading_gain       = parameter(0.62, 0.20, 1.20)
-center_gain        = parameter(0.42, 0.10, 0.90)
+center_gain        = parameter(0.55, 0.10, 1.10)
 ray_gain           = parameter(0.30, 0.05, 0.80)
 pass_gain          = parameter(1.85, 0.40, 2.50)
 awareness_range    = parameter(0.70, 0.30, 0.95)
 closing_trigger    = parameter(0.025, 0.00, 0.18)
 traffic_gain       = parameter(0.80, 0.10, 1.60)
-steering_smoothing = parameter(0.16, 0.00, 0.45)
+steering_smoothing = parameter(0.14, 0.00, 0.45)
 yaw_damping        = parameter(0.16, 0.00, 0.45)
 slide_correction   = parameter(0.34, 0.05, 0.80)
 understeer_comp    = parameter(0.08, 0.00, 0.22)
 oversteer_counter  = parameter(0.30, 0.05, 0.65)
 
 # Trainable pace and strategy parameters.
-corner_caution = parameter(0.58, 0.25, 0.90)
-slip_caution   = parameter(0.42, 0.10, 0.80)
-throttle_gain  = parameter(1.85, 0.80, 3.00)
-brake_gain     = parameter(1.45, 0.60, 2.40)
-wear_caution   = parameter(0.28, 0.00, 0.60)
+corner_caution = parameter(0.40, 0.15, 0.90)
+slip_caution   = parameter(0.22, 0.05, 0.60)
+throttle_gain  = parameter(2.30, 0.80, 3.00)
+brake_gain     = parameter(1.30, 0.60, 2.40)
+wear_caution   = parameter(0.24, 0.00, 0.60)
 pit_wear       = parameter(0.70, 0.40, 0.92)
+optimal_slip   = parameter(0.40, 0.20, 0.60)
+slip_hunt_gain = parameter(1.70, 0.50, 3.00)
 
 # The waypoint vectors lead the faster steering rack into the approaching
 # corner. Near points control turn-in; far points begin the rotation early.
@@ -33,6 +36,8 @@ waypoint_command = (
     + (waypoint_20_right * 0.46)
     + (waypoint_40_right * 0.20)
 ) * waypoint_gain
+
+wall_danger    = parameter(0.16, 0.05, 0.35)
 
 # Keep room on both sides. The extra 18/90 degree rays make this useful in
 # hairpins where the original five-ray fan cannot see the inside boundary.
@@ -49,6 +54,52 @@ classic_open_side = (
     right + far_right * 0.40
     - left - far_left * 0.40
 )
+# Wall avoidance is GATED, not continuous. edge_balance on its own reads
+# "close to inside wall while clipping the apex" the same as "about to hit
+# the wall" and steers away from both — which was quietly overriding the
+# apex line every corner. wall_avoid only wakes up once a wall is actually
+# within wall_danger distance, so deliberately running close to the kerb no
+# longer triggers a false-alarm correction back to center.
+left_danger  = clamp((wall_danger - left_space) / wall_danger, 0.0, 1.0)
+right_danger = clamp((wall_danger - right_space) / wall_danger, 0.0, 1.0)
+wall_avoid = (right_danger - left_danger) * 2.2
+
+# --- Track-limit racing line: entry-wide / apex-tight / exit-wide ---------
+# corner_phase is ONE continuous signed value, not two independent terms, so
+# it can't cancel itself back to "just drive the middle" the way separate
+# entry/apex signals could. It reads WHERE the track's curvature currently
+# peaks along the lookahead:
+#   - far_curve leads (the 40m point sees the corner first)      -> phase < 0, aim OUTSIDE (entry)
+#   - near_curve overtakes it once we're actually turning in     -> phase > 0, aim at the APEX
+#   - near_curve fades again as the track ahead straightens out  -> phase swings back < 0,
+#     which tracks the car out to the far edge and lets the corner unwind
+#     smoothly instead of snapping back to centerline the moment we clip it.
+far_curve  = abs(corner_curvature_40)
+mid_curve  = abs(corner_curvature_20)
+near_curve = abs(corner_curvature_10)
+corner_phase = clamp(
+    (near_curve - far_curve) * 2.4
+    - (mid_curve - near_curve) * 1.8,
+    -1.0,
+    1.0
+)
+corner_direction = sign(
+    (corner_curvature_20 * 0.6) + (corner_curvature_40 * 0.4)
+)
+# left_space + right_space approximates total track width and stays roughly
+# constant as the car moves laterally (shift right and left_space grows by
+# about what right_space loses). Using the NEAREST wall distance here instead
+# would shrink toward zero exactly as the car approaches the apex, cancelling
+# its own target — that was the bug that made it bail back to center.
+track_width = clamp((left_space + right_space) * 0.5, 0.0, 1.0)
+target_offset = corner_direction * corner_phase * 0.95 * track_width
+offset_error = target_offset - racing_line_offset
+
+# corner_load fades waypoint_command's centering pull while we're actually
+# in a corner. Without this the apex line spends the whole corner fighting
+# a stronger "go back to the middle" signal from the raw waypoint nodes,
+# which is why it lost that fight before.
+corner_load = clamp(near_curve * 1.6 + mid_curve * 0.8, 0.0, 1.0)
 
 # Racecraft is controller-owned during training. All three nearby-car vectors
 # contribute to the open-lane choice, including cars beside or behind us.
@@ -66,10 +117,21 @@ traffic_bias = (
         * clamp(1.0 - abs(opponent_3_forward) * 3.0, 0.0, 1.0)
     )
 ) * traffic_gain
+launch_gate  = parameter(0.05, 0.00, 0.15)
+min_pass_room = parameter(0.24, 0.10, 0.45)
+
 lane_signal = edge_balance + traffic_bias
-learned_side = sign(lane_signal)
-if abs(lane_signal) < 0.03:
-    learned_side = 1.0
+# Hysteresis: keep whichever side we're already committed to (read from our
+# own last steering output) unless the alternative is clearly better by a
+# real margin. A plain sign(lane_signal) flips every frame that noise pushes
+# it across zero — with grid neighbors on both sides that's most frames,
+# which is the side-to-side wiggle.
+side_bias = sign(previous_steering)
+if side_bias == 0.0:
+    side_bias = 1.0
+learned_side = side_bias
+if abs(lane_signal) > 0.12:
+    learned_side = sign(lane_signal)
 learned_passing = 0.0
 clearing_pass = 0.0
 if (
@@ -79,6 +141,10 @@ if (
         closing_speed > closing_trigger
         or car_ahead_distance < awareness_range * 0.75
     )
+    # Don't commit to a pass maneuver against a car that hasn't started
+    # moving either — that's a standing grid box, not a passing opportunity.
+    # The moment either car actually rolls, this opens back up immediately.
+    and (speed > launch_gate or opponent_1_velocity_forward > launch_gate)
 ):
     learned_passing = 1.0
 # Hold the chosen lane until the passed car is safely behind. Without this
@@ -102,19 +168,61 @@ if (
 ):
     active_pass_side = -sign(opponent_1_right)
 
-path_command = waypoint_command
+# Room shapes how hard we commit, but no longer gates it off entirely — a
+# tight gap gets a smaller, more careful line adjustment instead of giving
+# up. min_pass_room is now a "full commitment" reference distance, not a
+# hard requirement to even attempt something.
+danger_ttc  = parameter(0.30, 0.12, 0.55)
+crash_gain  = parameter(2.2, 1.0, 4.0)
+corner_yield = parameter(0.55, 0.20, 0.85)
+
+chosen_room   = right_space if active_pass_side > 0.0 else left_space
+opposite_room = left_space if active_pass_side > 0.0 else right_space
+if chosen_room < min_pass_room and opposite_room > chosen_room + 0.08:
+    active_pass_side = -active_pass_side
+    chosen_room = opposite_room
+room_commit = clamp(chosen_room / min_pass_room, 0.20, 1.0)
+
+# Real crash risk is time-to-contact, not raw distance — a car ahead at
+# matched speed is safe no matter how close; one closing fast into a short
+# gap is not. This is what's allowed to make the car actually back off.
+time_to_contact = car_ahead_distance / clamp(closing_speed, 0.05, 4.0)
+crash_risk = clamp(1.0 - (time_to_contact / danger_ttc), 0.0, 1.0)
+lateral_close = clamp(
+    -opponent_1_velocity_right * active_pass_side * crash_gain, 0.0, 1.0
+)
+crash_risk = clamp(max(crash_risk, lateral_close), 0.0, 1.0)
+
+# Yielding to the corner only applies if we're on the OUTSIDE of it and
+# haven't drawn alongside yet — diving to the inside under late braking is a
+# legitimate divebomb, not a mistake, and gets no penalty here at all.
+outside_line = clamp(-active_pass_side * corner_direction, 0.0, 1.0)
+alongside = clamp(abs(car_ahead_side) * 2.0, 0.0, 1.0)
+corner_risk = clamp(
+    corner_load * outside_line * (1.0 - alongside) * corner_yield, 0.0, 1.0
+)
+
+abort_risk = clamp(max(crash_risk, corner_risk), 0.0, 1.0)
+# Floor of 0.08 — the car always keeps adjusting its line and looking for
+# the gap rather than freezing completely, even when mostly backed off.
+pass_commit = clamp(room_commit * (1.0 - abort_risk), 0.08, 1.0)
+
+path_command = waypoint_command * (1.0 - corner_load * 0.65)
 pass_command = 0.0
 if active_passing > 0.5:
-    path_command = waypoint_command * 0.20
+    path_command = waypoint_command * (1.0 - pass_commit * 0.80)
     pass_command = (
-        (active_pass_side * 0.82 - racing_line_offset) * pass_gain
+        (active_pass_side * 0.82 - racing_line_offset) * pass_gain * pass_commit
     )
 
+# The apex offset gets a bigger vote the harder we're actually cornering
+# (corner_load), and settles to a gentle centering pull on straights where
+# there's no apex to hit anyway.
 desired_steering = (
     path_command
     + (heading_error * heading_gain)
-    - (racing_line_offset * center_gain)
-    + (edge_balance * ray_gain)
+    + (offset_error * center_gain * (0.6 + corner_load * 1.6))
+    + (wall_avoid * ray_gain)
     + pass_command
 )
 
@@ -139,11 +247,16 @@ steering = clamp(
     1.0
 )
 if active_passing > 0.5:
-    steering = clamp(
+    quick_pass_steering = clamp(
         (
             (active_pass_side * 0.82 - racing_line_offset) * pass_gain
             + heading_error * 1.10
         ),
+        -1.0,
+        1.0
+    )
+    steering = clamp(
+        steering * (1.0 - pass_commit) + quick_pass_steering * pass_commit,
         -1.0,
         1.0
     )
@@ -158,7 +271,12 @@ curve_demand = clamp(
     1.0
 )
 if active_passing > 0.5:
-    curve_demand = curve_demand * 0.25
+    # Suppression scales with how committed we actually are, capped at 75% —
+    # never so much that braking awareness disappears entirely. When
+    # abort_risk has pulled pass_commit down (real danger, or an outside
+    # line that can't make the apex) this naturally restores most of the
+    # normal cornering caution instead of running in blind.
+    curve_demand = curve_demand * clamp(1.0 - pass_commit * 0.75, 0.25, 1.0)
 visibility = clamp(forward * 1.22, 0.24, 1.0)
 stint_pace = clamp(
     1.0
@@ -170,49 +288,64 @@ stint_pace = clamp(
 )
 target_speed = clamp(
     (
-        1.04
+        1.06
         - (curve_demand * corner_caution)
-        - (abs(steering) * 0.13)
+        - (abs(steering) * 0.10)
         - (tire_slip * slip_caution)
     ) * visibility * stint_pace,
-    0.20,
+    0.24,
     1.0
 )
 speed_error = target_speed - speed
-traction_power = clamp(traction - (oversteer * 0.30), 0.20, 1.0)
+traction_power = clamp(traction - (oversteer * 0.28), 0.25, 1.0)
+
+# --- Slip-seeking throttle: hunt the grip limit instead of shying from it --
+# optimal_slip is the sweet spot where longitudinal grip peaks. Rather than
+# only backing throttle off when we're already over target_speed, we push
+# throttle up whenever measured tire_slip sits below optimal_slip — even
+# mid-corner — and only lift when slip exceeds it. previous_throttle gives
+# the controller memory so it climbs smoothly toward the limit each frame
+# instead of resetting to a conservative guess every tick.
+slip_margin = optimal_slip - tire_slip
+throttle_from_slip = clamp(
+    previous_throttle + (slip_margin * slip_hunt_gain),
+    0.0,
+    1.0
+)
+throttle_from_speed = clamp(speed_error * throttle_gain, 0.0, 1.0)
 throttle = (
-    clamp(speed_error * throttle_gain, 0.0, 1.0)
+    max(throttle_from_speed, throttle_from_slip * 0.92)
     * traction_power
 )
-brake = clamp((-speed_error - 0.025) * brake_gain, 0.0, 0.88)
+brake = clamp((-speed_error - 0.02) * brake_gain, 0.0, 0.88)
+# Slip-seeking never overrides the brake pedal — if we're well over the
+# target speed we still brake even while hunting for throttle grip.
+if speed_error < -0.05:
+    throttle = min(throttle, clamp(speed_error + 0.30, 0.0, 1.0))
 
 # First gear recovery and high-RPM control keep the car responsive without
 # repeatedly striking the limiter.
 if gear < 0.26 and speed < 0.18:
-    throttle = max(throttle, 0.20)
+    throttle = max(throttle, 0.22)
 if rpm > 0.97:
     throttle = min(throttle, 0.92)
 
-# Use the nearest opponent's relative speed as an early rear-contact warning.
-opponent_closing = clamp(-opponent_1_velocity_forward, 0.0, 1.0)
+# Rear-contact caution now runs on the same time-to-contact logic as the
+# passing risk check: a car sitting close ahead at matched speed is safe and
+# shouldn't be braked for, while one we're actually closing on fast gets
+# treated with real caution. very_close is a last-resort hard floor so
+# genuine near-contact is always caught even if the TTC math is noisy.
+follow_ttc = car_ahead_distance / clamp(closing_speed, 0.05, 4.0)
+follow_risk = clamp(1.0 - (follow_ttc / danger_ttc), 0.0, 1.0)
+very_close = clamp(1.0 - car_ahead_distance / 0.10, 0.0, 1.0)
+near_risk = clamp(max(follow_risk, very_close), 0.0, 1.0)
 if (
     car_ahead > 0.5
     and car_ahead_distance < 0.58
     and abs(car_ahead_side) < 0.52
 ):
-    throttle = min(
-        throttle,
-        clamp(car_ahead_distance / 0.58 - opponent_closing * 0.25, 0.0, 1.0)
-    )
-    brake = max(
-        brake,
-        clamp(
-            (0.58 - car_ahead_distance) * 1.85
-            + opponent_closing * 0.70,
-            0.0,
-            0.82
-        )
-    )
+    throttle = min(throttle, clamp(1.0 - near_risk, 0.15, 1.0))
+    brake = max(brake, clamp(near_risk * 0.85, 0.0, 0.85))
 
 # A committed pass uses a stable lane-change controller. Centreline-relative
 # waypoint vectors intentionally pause here because lateral offset is the goal.
@@ -230,8 +363,9 @@ if active_passing > 0.5:
         + sign(pass_steering)
         * (understeer - oversteer) * 0.28
     )
+    pass_steering = clamp(pass_steering, -1.0, 1.0)
     steering = clamp(
-        pass_steering,
+        steering * (1.0 - pass_commit) + pass_steering * pass_commit,
         -1.0,
         1.0
     )
@@ -239,6 +373,20 @@ if active_passing > 0.5:
         (
             forward * 1.10 - abs(steering) * 0.25
         ) * stint_pace,
+        0.20,
+        1.0
+    )
+    # forward only sees track edges, not the car we're trying to get past —
+    # it happily reads "clear" while we're still wedged directly behind one.
+    # Cap the target speed by how much of our path that car still occupies,
+    # so throttle doesn't floor (spin/push) while stuck; once we're actually
+    # alongside (car_ahead_side grows) this releases on its own.
+    still_blocked = (
+        clamp(1.0 - abs(car_ahead_side) * 2.2, 0.0, 1.0)
+        * clamp(1.0 - car_ahead_distance / 0.35, 0.0, 1.0)
+    )
+    pass_target_speed = clamp(
+        pass_target_speed - still_blocked * 0.65,
         0.20,
         1.0
     )
@@ -250,27 +398,44 @@ if active_passing > 0.5:
         0.20,
         1.0
     )
-    throttle = clamp(
+    pass_throttle = clamp(
         (pass_target_speed - speed) * 2.00,
         0.0,
         1.0
     ) * pass_grip
-    brake = 0.0
+    # Blend, don't overwrite: at low commit (tight gap, real crash risk, or
+    # an outside line that can't make an imminent corner) the car mostly
+    # keeps its normal, already-braking-aware throttle/brake instead of
+    # losing all cornering caution just because a pass is technically "on".
+    throttle = clamp(
+        throttle * (1.0 - pass_commit) + pass_throttle * pass_commit,
+        0.0,
+        1.0
+    )
+    brake = brake * (1.0 - pass_commit)
     if (
         car_ahead > 0.5
         and car_ahead_distance < 0.24
         and abs(car_ahead_side) < 0.58
     ):
         throttle = min(throttle, car_ahead_distance / 0.24)
-        brake = clamp(
-            (0.24 - car_ahead_distance) * 3.20,
-            0.0,
-            0.88
+        brake = max(
+            brake,
+            clamp(
+                (0.24 - car_ahead_distance) * 3.20,
+                0.0,
+                0.88
+            )
         )
 
 # Recovery prioritizes pointing back toward the centreline. It never holds the
 # brake at very low speed, so an agent can escape a wall or failed hairpin.
-if forward < 0.25:
+# Restricted to genuine wall/track-limit trouble — a stopped or slow CAR
+# ahead is handled by the emergency swerve below instead. Crawling at 0.05
+# throttle is correct in front of a wall; in front of fast traffic it just
+# turns the recovering car into the next obstacle, which is how one bad
+# reaction becomes a chain-reaction pile-up.
+if forward < 0.25 and car_ahead < 0.5:
     brake = 0.0
     throttle = 0.05
     steering = clamp(
@@ -278,6 +443,39 @@ if forward < 0.25:
         -1.0,
         1.0
     )
+
+# --- Emergency swerve: commit to a side instead of braking and hoping ------
+# The caution block above only ever scales throttle/brake — if closing speed
+# is high enough that braking alone won't avoid contact, nothing was ever
+# steering around the problem, which is the "can't decide, stops on track"
+# failure. This triggers off the same time-to-contact risk already computed,
+# so it engages before point-blank range rather than after, and it always
+# picks a side and commits rather than freezing. No hysteresis here — an
+# emergency needs the freshest read of where the gap actually is right now.
+emergency_trigger = parameter(0.55, 0.30, 0.80)
+emergency = clamp(max(crash_risk, near_risk), 0.0, 1.0)
+if car_ahead > 0.5 and emergency > emergency_trigger and abs(car_ahead_side) < 0.60:
+    emergency_side = sign(edge_balance + traffic_bias)
+    if abs(edge_balance + traffic_bias) < 0.05:
+        emergency_side = sign(classic_open_side)
+    if emergency_side == 0.0:
+        emergency_side = 1.0
+    steering = clamp(
+        (emergency_side * 0.95) + (heading_error * 0.5),
+        -1.0,
+        1.0
+    )
+    # A fast, committed dodge is what keeps this car from becoming a wall
+    # for the one behind it. Only cut throttle to nothing if the escape
+    # side genuinely has no room at all — otherwise go, don't crawl.
+    escape_room = right_space if emergency_side > 0.0 else left_space
+    if escape_room > wall_danger:
+        throttle = clamp(max(throttle, 0.35), 0.0, 0.75)
+        brake = min(brake, 0.35)
+    else:
+        throttle = 0.0
+        brake = max(brake, 0.75)
+
 if off_track > 0.5:
     brake = 0.0
     throttle = min(max(throttle, 0.16), 0.34)

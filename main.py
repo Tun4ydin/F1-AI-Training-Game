@@ -7,6 +7,7 @@ import re
 from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import pygame
@@ -255,6 +256,8 @@ def seg_distance(point, a, b):
 
 class Track:
     SAMPLES_PER_SECTION = 14
+    TARGET_SPLINE_SAMPLES = 240
+    MIN_SAMPLES_PER_SECTION = 4
 
     def __init__(
         self, points=None, name="Starter Ring", kerb_points=None, features=None,
@@ -297,7 +300,11 @@ class Track:
             for i in range(len(self.points))
         ]
         self.kerb_width_m = self.road_width_m + 2.0
-        self.samples_per_section = 1 if geometry == "sampled" else self.SAMPLES_PER_SECTION
+        self.samples_per_section = (
+            1
+            if geometry == "sampled"
+            else self.spline_samples_per_section(len(self.points))
+        )
         self.kerb_points = set(kerb_points) if kerb_points is not None else self._automatic_kerbs()
         default_sectors = [
             len(self.points) // 4, len(self.points) // 2, len(self.points) * 3 // 4,
@@ -353,6 +360,7 @@ class Track:
         )
         self._pit_box_positions_cache = None
         self._ribbon_cache = {}
+        self._open_ribbon_cache = {}
         self.segment_lengths_m = [
             self.centerline[i].distance_to(self.centerline[(i + 1) % len(self.centerline)])
             for i in range(len(self.centerline))
@@ -365,6 +373,17 @@ class Track:
         self.measured_length_m = self.cumulative_lengths_m[-1]
         self.lap_length_m = float(declared_length_m or self.measured_length_m)
         self._build_spatial_index()
+
+    @classmethod
+    def spline_samples_per_section(cls, point_count):
+        """Avoid oversampling tracks whose editor nodes are already dense."""
+        if point_count <= 0:
+            return cls.SAMPLES_PER_SECTION
+        return int(clamp(
+            math.ceil(cls.TARGET_SPLINE_SAMPLES / point_count),
+            cls.MIN_SAMPLES_PER_SECTION,
+            cls.SAMPLES_PER_SECTION,
+        ))
 
     def _build_spatial_index(self):
         self.spatial_cell_m = 50.0
@@ -389,6 +408,13 @@ class Track:
             self.pitlane_centerline_widths_m,
             default=PITLANE_WIDTH_M,
         ) / 2
+        # A 50 m cell is useful for a large main circuit, but it is far too
+        # coarse for compact pit roads. On small maps it places nearly every
+        # pit segment in one bucket, making each ray/wheel containment probe
+        # scan the whole pitlane. Keep pit cells close to the road's scale.
+        self.pitlane_spatial_cell_m = clamp(
+            maximum_half_width * 3.0, 8.0, 18.0
+        )
         self.pitlane_bounds = (
             min(point.x for point in self.pitlane_centerline)
             - maximum_half_width,
@@ -408,19 +434,19 @@ class Track:
             ) / 2
             minimum_x = math.floor(
                 (min(start.x, end.x) - segment_half_width)
-                / self.spatial_cell_m
+                / self.pitlane_spatial_cell_m
             )
             maximum_x = math.floor(
                 (max(start.x, end.x) + segment_half_width)
-                / self.spatial_cell_m
+                / self.pitlane_spatial_cell_m
             )
             minimum_y = math.floor(
                 (min(start.y, end.y) - segment_half_width)
-                / self.spatial_cell_m
+                / self.pitlane_spatial_cell_m
             )
             maximum_y = math.floor(
                 (max(start.y, end.y) + segment_half_width)
-                / self.spatial_cell_m
+                / self.pitlane_spatial_cell_m
             )
             for cell_x in range(minimum_x, maximum_x + 1):
                 for cell_y in range(minimum_y, maximum_y + 1):
@@ -476,8 +502,8 @@ class Track:
             p1 = self.points[i]
             p2 = self.points[(i + 1) % count]
             p3 = self.points[(i + 2) % count]
-            for sample in range(self.SAMPLES_PER_SECTION):
-                t = sample / self.SAMPLES_PER_SECTION
+            for sample in range(self.samples_per_section):
+                t = sample / self.samples_per_section
                 curve.append(self._catmull(p0, p1, p2, p3, t))
                 near_corner = (i in self.kerb_points and t < .30) or (
                     (i + 1) % count in self.kerb_points and t > .70
@@ -648,9 +674,15 @@ class Track:
             sampled.append(float(best_width))
         return sampled
 
-    @staticmethod
-    def open_ribbon_edges(points, widths):
-        """Build joined left/right edges for an open variable-width road."""
+    def open_ribbon_edges(self, points, widths):
+        """Build and cache joined edges for an open variable-width road."""
+        cache_key = (
+            tuple((round(p.x, 6), round(p.y, 6)) for p in points),
+            tuple(round(float(width), 6) for width in widths),
+        )
+        cached = self._open_ribbon_cache.get(cache_key)
+        if cached is not None:
+            return cached
         count = len(points)
         if count < 2:
             return [], []
@@ -666,7 +698,9 @@ class Track:
             half_width = max(0.5, float(widths[index]) / 2)
             left.append(point + normal * half_width)
             right.append(point - normal * half_width)
-        return left, right
+        result = (left, right)
+        self._open_ribbon_cache[cache_key] = result
+        return result
 
     def pitlane_nearest(self, point, local_only=False):
         """Return distance and position on the open pitlane polyline.
@@ -679,9 +713,12 @@ class Track:
         point = Vector2(point)
         best = (float("inf"), Vector2(), None, 0.0)
         if local_only:
+            cell_size = getattr(
+                self, "pitlane_spatial_cell_m", self.spatial_cell_m
+            )
             cell = (
-                math.floor(point.x / self.spatial_cell_m),
-                math.floor(point.y / self.spatial_cell_m),
+                math.floor(point.x / cell_size),
+                math.floor(point.y / cell_size),
             )
             candidates = self.pitlane_spatial_segments.get(cell, ())
         else:
@@ -821,7 +858,7 @@ class Track:
         self._pit_box_positions_cache = tuple(positions)
         return self._pit_box_positions_cache
 
-    def nearest(self, point):
+    def nearest(self, point, fallback=True):
         best = (1e9, Vector2(), 0, 0)
         point_vector = Vector2(point)
         cell = (
@@ -833,6 +870,8 @@ class Track:
             for offset_y in (-1, 0, 1):
                 candidates.update(self.spatial_segments.get((cell[0] + offset_x, cell[1] + offset_y), ()))
         if not candidates:
+            if not fallback:
+                return best
             candidates = range(len(self.centerline))
         for i in candidates:
             a = self.centerline[i]
@@ -966,7 +1005,10 @@ class Track:
     def surface(self, point):
         if self.is_in_pitlane(point):
             return "pitlane"
-        distance, _, index, t = self.nearest(point)
+        # Surface probes include thousands of ray samples per frame. A point
+        # with no nearby indexed segment is definitively outside the circuit,
+        # so it must not fall back to scanning the entire centerline.
+        distance, _, index, t = self.nearest(point, fallback=False)
         local_width = self.width_at_segment(index, t)
         if distance <= local_width / 2:
             return "asphalt"
@@ -2496,7 +2538,10 @@ class Car:
         )
         if current_speed > 1e-9 and cornering_scrub > 0:
             remaining_speed = current_speed - cornering_scrub
-            if remaining_speed <= 1e-9:
+            # pygame-ce considers vectors below roughly 1e-6 to have zero
+            # length inside scale_to_length. Snap that physically negligible
+            # residual to rest before asking SDL to normalize it.
+            if remaining_speed <= 1e-6:
                 self.velocity.update(0.0, 0.0)
             else:
                 self.velocity.scale_to_length(remaining_speed)
@@ -2521,7 +2566,7 @@ class Car:
         )
         if current_speed > 1e-9 and coast_drag > 0:
             remaining_speed = current_speed - coast_drag
-            if remaining_speed <= 1e-9:
+            if remaining_speed <= 1e-6:
                 self.velocity.update(0.0, 0.0)
             else:
                 self.velocity.scale_to_length(remaining_speed)
@@ -3321,6 +3366,8 @@ class Game:
         self.window = pygame.display.set_mode(
             initial_window_size, self.display_flags
         )
+        self._system_clipboard_ready = False
+        self.ensure_system_clipboard()
         try:
             prewarm_car_sprites()
         except (FileNotFoundError, OSError, pygame.error):
@@ -3335,7 +3382,7 @@ class Game:
         self._native_font_cache = {}
         self.native_ui_modes = {
             "menu", "editor", "algorithm", "race_setup",
-            "hotlap_setup", "name_dialog",
+            "hotlap_setup", "replay_setup", "name_dialog",
         }
         self.viewport_scale = 1.0
         self.viewport_rect = pygame.Rect(0, 0, WIDTH, HEIGHT)
@@ -3378,6 +3425,10 @@ class Game:
         self.cars = []
         self.generation = 0
         self.best_brain = Brain.load_best()
+        self.best_fitness = None
+        self.best_generation = 0
+        self.last_generation_fitness = None
+        self.last_generation_improved = False
         self.paused = False
         self.session_time = 0.0
         self.follow = 0
@@ -3458,6 +3509,16 @@ class Game:
         self.replay_frames = []
         self.replay_tick = 0
         self.replay_saved = False
+        self.selected_replay = None
+        self.replay_data = None
+        self.replay_track = None
+        self.replay_cars = []
+        self.replay_frame_times = []
+        self.replay_time = 0.0
+        self.replay_rate = 1.0
+        self.replay_resume_rate = 1.0
+        self.replay_follow = 0
+        self.replay_tower_page = 0
         self.event_camera = False
         self.camera_until = 0
         self.flag_state = "GREEN"
@@ -3524,10 +3585,11 @@ class Game:
             enable_live_theme_updates=False,
         )
         definitions = (
-            ((70, 175, 535, 86), "01   TRACK STUDIO"),
-            ((675, 175, 535, 86), "02   AI TRAINING"),
-            ((70, 280, 535, 86), "03   RACE WEEKEND"),
-            ((675, 280, 535, 86), "04   TWO-LAP HOTLAP"),
+            ((70, 170, 535, 74), "01   TRACK STUDIO"),
+            ((675, 170, 535, 74), "02   AI TRAINING"),
+            ((70, 260, 535, 74), "03   RACE WEEKEND"),
+            ((675, 260, 535, 74), "04   TWO-LAP HOTLAP"),
+            ((70, 350, 1140, 64), "05   REPLAY THEATRE"),
         )
         for index, (rect, label) in enumerate(definitions):
             button = pygame_gui.elements.UIButton(
@@ -4069,13 +4131,16 @@ class Game:
             [point * scale + offset for point in vectors],
         )
 
-    def draw_minimap(self, cars, focused=None, rect=(16, 16, 220, 165)):
+    def draw_minimap(
+        self, cars, focused=None, rect=(16, 16, 220, 165), track=None
+    ):
         """Draw the complete circuit and color-coded live car positions."""
+        track = track or self.track
         rect = pygame.Rect(rect)
-        cache_key = (id(self.track), rect.size, self.track.name)
+        cache_key = (id(track), rect.size, track.name)
         cached = self._minimap_cache.get(cache_key)
         if cached is None:
-            cached = self._build_minimap_background(rect)
+            cached = self._build_minimap_background(rect, track)
             # A track replacement invalidates every old projection.
             self._minimap_cache = {cache_key: cached}
         background, scale, offset, map_rect = cached
@@ -4105,8 +4170,9 @@ class Game:
             pygame.draw.circle(overlay, WHITE, focused_marker, 6, 1)
         self.screen.blit(overlay, rect)
 
-    def _build_minimap_background(self, rect):
+    def _build_minimap_background(self, rect, track=None):
         """Render static minimap geometry once for the active track."""
+        track = track or self.track
         overlay = pygame.Surface(rect.size, pygame.SRCALPHA)
         pygame.draw.rect(
             overlay, (*UI_SURFACE, 238), overlay.get_rect(),
@@ -4117,7 +4183,7 @@ class Game:
             border_radius=13,
         )
         title = self.fonts["tiny"].render(
-            f"TRACK MAP  •  {self.track.name[:14].upper()}",
+            f"TRACK MAP  •  {track.name[:14].upper()}",
             True, CYAN,
         )
         overlay.blit(title, (10, 7))
@@ -4125,9 +4191,9 @@ class Game:
         map_rect = pygame.Rect(
             16, 32, rect.width - 32, rect.height - 47
         )
-        track_count = len(self.track.centerline)
+        track_count = len(track.centerline)
         scale, offset, projected_points = self.minimap_projection(
-            self.track.centerline + self.track.pitlane_centerline,
+            track.centerline + track.pitlane_centerline,
             map_rect,
         )
         track_points = projected_points[:track_count]
@@ -4143,9 +4209,9 @@ class Game:
                 overlay, (196, 213, 208), True, track_points
             )
             start_index = (
-                int(self.track.features.get("start_finish", 0))
-                % max(len(self.track.points), 1)
-            ) * self.track.samples_per_section
+                int(track.features.get("start_finish", 0))
+                % max(len(track.points), 1)
+            ) * track.samples_per_section
             start = track_points[start_index % len(track_points)]
             pygame.draw.circle(overlay, YELLOW, start, 3)
         if len(pit_points) >= 2:
@@ -4639,10 +4705,28 @@ class Game:
         self.race_name_anchor = None
         pygame.key.stop_text_input()
 
+    def consider_training_champion(self):
+        """Promote only a generation winner that beats the all-time record."""
+        if not self.cars:
+            return None, False
+        champion = max(self.cars, key=lambda car: car.fitness)
+        champion_fitness = float(champion.fitness)
+        previous_best = getattr(self, "best_fitness", None)
+        improved = (
+            previous_best is None
+            or champion_fitness > previous_best
+        )
+        self.last_generation_fitness = champion_fitness
+        self.last_generation_improved = improved
+        if improved:
+            self.best_brain = champion.brain
+            self.best_fitness = champion_fitness
+            self.best_generation = self.generation
+        return champion, improved
+
     def reset_training(self, evolve=False):
         if evolve and self.cars:
-            champion = max(self.cars, key=lambda car: car.fitness)
-            self.best_brain = champion.brain
+            self.consider_training_champion()
             self.generation += 1
         self.cars = []
         powertrain = getattr(self, "training_generation", "Hybrid")
@@ -4730,6 +4814,10 @@ class Game:
                 program, self.algorithm_source
             )
             self.generation = 0
+            self.best_fitness = None
+            self.best_generation = 0
+            self.last_generation_fitness = None
+            self.last_generation_improved = False
             self.rain_level = 0.0
             self.event_log = []
             self.reset_training()
@@ -4769,19 +4857,35 @@ class Game:
 
     def editor_set_clipboard(self, text):
         self.algorithm_clipboard = text
+        if not self.ensure_system_clipboard():
+            return
         try:
             pygame.scrap.put(pygame.SCRAP_TEXT, text.encode("utf-8") + b"\0")
-        except pygame.error:
-            pass
+        except (pygame.error, TypeError):
+            self._system_clipboard_ready = False
 
     def editor_get_clipboard(self):
+        if not self.ensure_system_clipboard():
+            return self.algorithm_clipboard
         try:
             raw = pygame.scrap.get(pygame.SCRAP_TEXT)
             if raw:
-                return raw.decode("utf-8", errors="ignore").rstrip("\0")
-        except pygame.error:
-            pass
+                text = raw.rstrip(b"\0").decode("utf-8", errors="replace")
+                return text.replace("\r\n", "\n").replace("\r", "\n")
+        except (pygame.error, TypeError):
+            self._system_clipboard_ready = False
         return self.algorithm_clipboard
+
+    def ensure_system_clipboard(self):
+        """Initialize SDL's clipboard after the display is available."""
+        if getattr(self, "_system_clipboard_ready", False):
+            return True
+        try:
+            pygame.scrap.init()
+            self._system_clipboard_ready = True
+        except (pygame.error, TypeError):
+            self._system_clipboard_ready = False
+        return self._system_clipboard_ready
 
     def editor_restore(self, undo=True):
         source_stack = self.algorithm_undo if undo else self.algorithm_redo
@@ -4960,6 +5064,7 @@ class Game:
                 {
                     "name": car.name, "x": round(car.position.x, 2),
                     "y": round(car.position.y, 2), "angle": round(car.angle, 2),
+                    "color": list(car.color),
                     "lap": car.lap, "tyre": car.tyre, "wear": round(car.tyre_wear, 2),
                     "fuel": round(car.fuel, 2), "pit_requested": car.pit_requested,
                     "slipstream": round(car.slipstream, 3),
@@ -4993,10 +5098,17 @@ class Game:
 
     def save_replay(self):
         REPLAY_DIR.mkdir(parents=True, exist_ok=True)
-        path = REPLAY_DIR / "latest_race_replay.json"
+        if self.cars:
+            # Include the exact save moment and guarantee that even a replay
+            # saved during the start sequence contains a drawable frame.
+            self.capture_replay_frame()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        track_slug = component_filename(self.track.name, "")
+        path = REPLAY_DIR / f"{track_slug}_{timestamp}.json"
         path.write_text(json.dumps({
             "version": 1,
             "track": self.track.name,
+            "track_file": self.selected_track,
             "settings": self.race_settings,
             "teams": self.team_names if self.race_settings["teams"] else [],
             "events": self.event_log,
@@ -5005,6 +5117,636 @@ class Game:
         self.replay_saved = True
         self.notice(f"Replay saved: {path.name}")
         return path
+
+    def replay_choices(self):
+        """Return replay JSON filenames, newest first."""
+        try:
+            paths = sorted(
+                REPLAY_DIR.glob("*.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return []
+        return [path.name for path in paths]
+
+    def cycle_replay(self, amount=1):
+        choices = self.replay_choices()
+        if not choices:
+            self.selected_replay = None
+            return None
+        try:
+            index = choices.index(self.selected_replay)
+        except ValueError:
+            index = -1 if amount > 0 else 0
+        self.selected_replay = choices[(index + amount) % len(choices)]
+        return self.selected_replay
+
+    def replay_track_from_data(self, data):
+        """Resolve the circuit referenced by a replay, with legacy fallback."""
+        track_file = data.get("track_file")
+        if isinstance(track_file, str):
+            candidate = TRACK_DIR / Path(track_file).name
+            if candidate.exists():
+                return Track.load(candidate), False
+        track_name = str(data.get("track", ""))
+        for candidate in TRACK_DIR.glob("*.json"):
+            try:
+                metadata = json.loads(candidate.read_text())
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if str(metadata.get("name", "")) == track_name:
+                return Track.load(candidate), False
+        return self.track, True
+
+    @staticmethod
+    def replay_angle_lerp(first, second, amount):
+        delta = (float(second) - float(first) + 180.0) % 360.0 - 180.0
+        return float(first) + delta * amount
+
+    def start_selected_replay(self):
+        choices = self.replay_choices()
+        if self.selected_replay not in choices:
+            self.selected_replay = choices[0] if choices else None
+        if self.selected_replay is None:
+            self.notice("No replay JSON files are available")
+            return False
+        path = REPLAY_DIR / Path(self.selected_replay).name
+        try:
+            data = json.loads(path.read_text())
+            frames = data.get("frames")
+            if not isinstance(frames, list) or not frames:
+                raise ValueError("Replay contains no frames")
+            if not all(
+                isinstance(frame, dict)
+                and isinstance(frame.get("cars"), list)
+                and bool(frame["cars"])
+                for frame in frames
+            ):
+                raise ValueError("Replay frame data is invalid")
+            track, used_fallback = self.replay_track_from_data(data)
+            frame_times = [float(frame.get("time", 0.0)) for frame in frames]
+            if any(
+                right < left
+                for left, right in zip(frame_times, frame_times[1:])
+            ):
+                raise ValueError("Replay timestamps are not ordered")
+        except (
+            OSError, TypeError, ValueError, KeyError,
+            json.JSONDecodeError,
+        ) as error:
+            self.notice(f"Replay could not be loaded: {error}")
+            return False
+
+        self.replay_data = data
+        self.replay_track = track
+        self.replay_frame_times = frame_times
+        self.replay_time = frame_times[0]
+        self.replay_rate = 1.0
+        self.replay_resume_rate = 1.0
+        first_cars = frames[0]["cars"]
+        self.replay_cars = []
+        for index, record in enumerate(first_cars):
+            raw_color = record.get("color", COLORS[index % len(COLORS)])
+            try:
+                color = tuple(
+                    int(clamp(float(channel), 0, 255))
+                    for channel in raw_color[:3]
+                )
+                if len(color) != 3:
+                    raise ValueError
+            except (TypeError, ValueError):
+                color = COLORS[index % len(COLORS)]
+            self.replay_cars.append(Car(
+                Vector2(
+                    float(record.get("x", 0.0)),
+                    float(record.get("y", 0.0)),
+                ),
+                float(record.get("angle", 0.0)),
+                color,
+                Brain(),
+                name=str(record.get("name", f"Driver {index + 1}")),
+                generation=str(record.get("generation", "ICE")),
+            ))
+        focus = int(frames[0].get("focus", 0))
+        self.replay_follow = int(clamp(
+            focus, 0, max(len(self.replay_cars) - 1, 0)
+        ))
+        self.replay_tower_page = self.replay_follow // 10
+        self.camera_zoom = DEFAULT_CAMERA_ZOOM
+        self.apply_replay_time()
+        self.mode = "replay"
+        if used_fallback:
+            self.notice(
+                "Recorded circuit was not found; using the active circuit"
+            )
+        return True
+
+    def replay_frame_pair(self):
+        """Return timeline frames surrounding the current replay time."""
+        frames = self.replay_data["frames"]
+        right = bisect_right(self.replay_frame_times, self.replay_time)
+        left = int(clamp(right - 1, 0, len(frames) - 1))
+        right = int(clamp(right, left, len(frames) - 1))
+        start_time = self.replay_frame_times[left]
+        end_time = self.replay_frame_times[right]
+        amount = (
+            clamp(
+                (self.replay_time - start_time) / (end_time - start_time),
+                0.0, 1.0,
+            )
+            if end_time > start_time else 0.0
+        )
+        return frames[left], frames[right], amount
+
+    def apply_replay_time(self):
+        """Interpolate JSON snapshots into drawable car objects."""
+        if not self.replay_data or not self.replay_cars:
+            return
+        first_frame, second_frame, amount = self.replay_frame_pair()
+        first_cars = first_frame["cars"]
+        second_cars = second_frame["cars"]
+        for index, car in enumerate(self.replay_cars):
+            first = first_cars[min(index, len(first_cars) - 1)]
+            second = second_cars[min(index, len(second_cars) - 1)]
+            car.position.update(
+                float(first.get("x", 0.0))
+                + (float(second.get("x", 0.0)) - float(first.get("x", 0.0)))
+                * amount,
+                float(first.get("y", 0.0))
+                + (float(second.get("y", 0.0)) - float(first.get("y", 0.0)))
+                * amount,
+            )
+            car.angle = self.replay_angle_lerp(
+                first.get("angle", 0.0), second.get("angle", 0.0), amount
+            )
+            state = second if amount >= 0.5 else first
+            car.name = str(state.get("name", car.name))
+            car.generation = str(state.get("generation", car.generation))
+            car.lap = int(state.get("lap", 0))
+            car.tyre = str(state.get("tyre", "Medium"))
+            car.tyre_wear = float(state.get("wear", 0.0))
+            car.fuel = float(state.get("fuel", 0.0))
+            car.pit_requested = bool(state.get("pit_requested", False))
+            car.slipstream = float(state.get("slipstream", 0.0))
+            car.battery = float(state.get("battery", 0.0))
+            car.overtake_active = bool(state.get("overtake", False))
+            car.recharge_active = bool(state.get("recharge", False))
+            car.drs_eligible = bool(state.get("drs_eligible", False))
+            car.drs_active = bool(state.get("drs_active", False))
+            drs_gap = state.get("drs_gap_seconds")
+            car.drs_gap_seconds = (
+                float(drs_gap) if drs_gap is not None else float("inf")
+            )
+            car.brake_input = float(state.get("brake", 0.0))
+            car.race_aggression = float(state.get("aggression", 0.0))
+            car.aggression_error = float(
+                state.get("aggression_error", 0.0)
+            )
+            car.gear = int(state.get("gear", 1))
+            car.rpm = float(state.get("rpm", IDLE_ENGINE_RPM))
+            car.health = float(state.get("health", 100.0))
+            car.pitstops = int(state.get("pitstops", 0))
+            car.starting_position = int(
+                state.get("starting_position", index + 1)
+            )
+            car.finish_time = state.get("finish_time")
+            car.retirement_time = state.get("retirement_time")
+            car.retirement_reason = str(state.get("retirement_reason", ""))
+            car.removed_from_track = bool(
+                state.get("removed_from_track", False)
+            )
+            car.alive = car.health > 0.0 and car.retirement_time is None
+            car.team = str(state.get("team", ""))
+            car.brain_name = str(state.get("brain", "CURRENT SESSION"))
+            speed = float(state.get("speed_kph", 0.0)) / (FPS * 3.6)
+            car.velocity = Vector2(1, 0).rotate(car.angle) * speed
+            progress = self.replay_track.progress_metres(car.position)
+            car.race_distance_m = (
+                car.lap * self.replay_track.measured_length_m + progress
+            )
+            car.score = car.race_distance_m
+
+    def replay_seek(self, seconds):
+        if not self.replay_frame_times:
+            return
+        self.replay_time = clamp(
+            self.replay_time + float(seconds),
+            self.replay_frame_times[0],
+            self.replay_frame_times[-1],
+        )
+        self.apply_replay_time()
+
+    def set_replay_transport(self, direction):
+        """Select rewind/pause/fast-forward, accelerating on repeat presses."""
+        direction = int(clamp(direction, -1, 1))
+        if direction == 0:
+            if self.replay_rate:
+                self.replay_resume_rate = self.replay_rate
+            self.replay_rate = 0.0
+            return
+        if self.replay_rate * direction > 0:
+            rate = min(8.0, abs(self.replay_rate) * 2.0)
+        else:
+            rate = 1.0
+        self.replay_rate = direction * rate
+        self.replay_resume_rate = self.replay_rate
+
+    def toggle_replay_pause(self):
+        if self.replay_rate:
+            self.set_replay_transport(0)
+        else:
+            self.replay_rate = self.replay_resume_rate or 1.0
+
+    def replay_ranked_cars(self):
+        return sorted(
+            self.replay_cars, key=self.race_order_key, reverse=True
+        )
+
+    def sync_replay_tower_page(self, ranked):
+        if not ranked or not self.replay_cars:
+            self.replay_tower_page = 0
+            return
+        followed = self.replay_cars[int(clamp(
+            self.replay_follow, 0, len(self.replay_cars) - 1
+        ))]
+        rank_index = next(
+            (index for index, car in enumerate(ranked) if car is followed), 0
+        )
+        self.replay_tower_page = rank_index // 10
+
+    def change_replay_focus(self, ranked, direction):
+        if not ranked or not self.replay_cars:
+            return
+        followed = self.replay_cars[int(clamp(
+            self.replay_follow, 0, len(self.replay_cars) - 1
+        ))]
+        rank_index = next(
+            (index for index, car in enumerate(ranked) if car is followed), 0
+        )
+        rank_index = int(clamp(
+            rank_index + int(direction), 0, len(ranked) - 1
+        ))
+        selected = ranked[rank_index]
+        self.replay_follow = next(
+            index for index, car in enumerate(self.replay_cars)
+            if car is selected
+        )
+        self.replay_tower_page = rank_index // 10
+
+    @staticmethod
+    def replay_setup_rects():
+        return {
+            "previous": pygame.Rect(104, 392, 58, 52),
+            "next": pygame.Rect(1118, 392, 58, 52),
+            "start": pygame.Rect(420, 548, 440, 62),
+        }
+
+    def replay_setup(self, events):
+        self.draw_app_background()
+        self.text("REPLAY THEATRE", (70, 55), "title", WHITE)
+        self.text(
+            "LOAD A RACE RECORDING  /  DIRECT EVERY CAMERA",
+            (74, 112), "mono", CYAN,
+        )
+        choices = self.replay_choices()
+        if choices and self.selected_replay not in choices:
+            self.selected_replay = choices[0]
+        rects = self.replay_setup_rects()
+        card = pygame.Rect(70, 175, 1140, 320)
+        self.glass_card(card, accent=UI_VIOLET, radius=18)
+        self.section_heading(
+            "Replay file", (100, 202, 1080, 28), UI_VIOLET,
+            f"{len(choices)} recording{'s' if len(choices) != 1 else ''}",
+        )
+        if self.selected_replay:
+            path = REPLAY_DIR / self.selected_replay
+            try:
+                size_mb = path.stat().st_size / (1024 * 1024)
+            except OSError:
+                size_mb = 0.0
+            self.text(
+                self.selected_replay,
+                (WIDTH // 2, 315), "h2", WHITE, anchor="center",
+            )
+            self.text(
+                f"JSON RACE RECORDING  •  {size_mb:.1f} MB",
+                (WIDTH // 2, 357), "small", MUTED, anchor="center",
+            )
+        else:
+            self.text(
+                "NO REPLAY FILES FOUND",
+                (WIDTH // 2, 325), "h2", MUTED, anchor="center",
+            )
+            self.text(
+                "Save a completed or running race with R, then return here.",
+                (WIDTH // 2, 366), "small", MUTED, anchor="center",
+            )
+        for key, label in (("previous", "<"), ("next", ">")):
+            self.action_button(
+                rects[key], label, UI_VIOLET, bool(choices), secondary=True
+            )
+        self.action_button(
+            rects["start"], "Open replay", UI_VIOLET, bool(choices),
+            detail="Interpolated playback • ranked driver cameras",
+        )
+        self.text(
+            "LEFT/RIGHT selects  •  ENTER opens  •  ESC returns",
+            (WIDTH // 2, 667), "small", MUTED, anchor="center",
+        )
+        for event in events:
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.mode = "menu"
+                elif event.key == pygame.K_LEFT:
+                    self.cycle_replay(-1)
+                elif event.key == pygame.K_RIGHT:
+                    self.cycle_replay(1)
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self.start_selected_replay()
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if rects["previous"].collidepoint(event.pos):
+                    self.cycle_replay(-1)
+                elif rects["next"].collidepoint(event.pos):
+                    self.cycle_replay(1)
+                elif rects["start"].collidepoint(event.pos):
+                    self.start_selected_replay()
+
+    @staticmethod
+    def replay_transport_rects():
+        return {
+            "rewind": pygame.Rect(26, HEIGHT - 62, 82, 38),
+            "pause": pygame.Rect(116, HEIGHT - 62, 82, 38),
+            "forward": pygame.Rect(206, HEIGHT - 62, 82, 38),
+            "timeline": pygame.Rect(322, HEIGHT - 49, CANVAS_W - 350, 12),
+        }
+
+    @staticmethod
+    def format_replay_time(seconds):
+        seconds = max(0.0, float(seconds))
+        minutes, seconds = divmod(seconds, 60.0)
+        hours, minutes = divmod(int(minutes), 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:04.1f}"
+        return f"{minutes:02d}:{seconds:04.1f}"
+
+    def replay_timeline_fraction(self):
+        if len(self.replay_frame_times) < 2:
+            return 0.0
+        start = self.replay_frame_times[0]
+        duration = self.replay_frame_times[-1] - start
+        return clamp((self.replay_time - start) / max(duration, 1e-9), 0, 1)
+
+    def draw_replay_transport(self):
+        rects = self.replay_transport_rects()
+        card = pygame.Rect(16, HEIGHT - 72, CANVAS_W - 32, 58)
+        pygame.draw.rect(
+            self.screen, (5, 13, 16), card, border_radius=12
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER_BRIGHT, card, 1, border_radius=12
+        )
+        mouse = self.logical_mouse_position()
+        labels = {
+            "rewind": "J  REW",
+            "pause": "K  PLAY" if self.replay_rate == 0 else "K  PAUSE",
+            "forward": "L  FWD",
+        }
+        for key in ("rewind", "pause", "forward"):
+            rect = rects[key]
+            hovered = rect.collidepoint(mouse)
+            active = (
+                key == "rewind" and self.replay_rate < 0
+                or key == "pause" and self.replay_rate == 0
+                or key == "forward" and self.replay_rate > 0
+            )
+            pygame.draw.rect(
+                self.screen,
+                UI_VIOLET if hovered else UI_SURFACE_HOVER if active
+                else UI_SURFACE_RAISED,
+                rect, border_radius=8,
+            )
+            pygame.draw.rect(
+                self.screen,
+                UI_VIOLET if hovered or active else UI_BORDER,
+                rect, 1, border_radius=8,
+            )
+            self.text(
+                labels[key], rect.center, "tiny",
+                INK if hovered else WHITE, anchor="center",
+            )
+        timeline = rects["timeline"]
+        pygame.draw.rect(
+            self.screen, (35, 52, 51), timeline, border_radius=6
+        )
+        fraction = self.replay_timeline_fraction()
+        fill = timeline.copy()
+        fill.width = round(timeline.width * fraction)
+        if fill.width:
+            pygame.draw.rect(
+                self.screen, UI_VIOLET, fill, border_radius=6
+            )
+        knob_x = timeline.x + round(timeline.width * fraction)
+        pygame.draw.circle(
+            self.screen, WHITE, (knob_x, timeline.centery), 7
+        )
+        duration = self.replay_frame_times[-1]
+        rate = "PAUSED" if self.replay_rate == 0 else f"{self.replay_rate:+g}x"
+        self.text(
+            (
+                f"{self.format_replay_time(self.replay_time)}  /  "
+                f"{self.format_replay_time(duration)}   {rate}"
+            ),
+            (timeline.centerx, timeline.y - 18), "tiny", WHITE,
+            anchor="center",
+        )
+
+    def draw_replay_tower(self, ranked):
+        x = CANVAS_W
+        self.panel("Replay Director", "JSON PLAYBACK  •  MANUAL CAM")
+        settings = self.replay_data.get("settings", {})
+        target_laps = int(settings.get("laps", 0))
+        focused = self.replay_cars[self.replay_follow]
+        lap_label = f"LAP {focused.lap + 1}"
+        if target_laps:
+            lap_label += f" / {target_laps}"
+        self.text(lap_label, (x + 20, 101), "h2", WHITE)
+        self.text(
+            self.format_replay_time(self.replay_time),
+            (x + 170, 108), "mono", YELLOW,
+        )
+        page, start, end = self.race_tower_page_bounds(
+            len(ranked), self.replay_tower_page
+        )
+        self.replay_tower_page = page
+        self.text(
+            f"POSITIONS {start + 1}–{end}",
+            (x + 20, 128), "tiny", MUTED,
+        )
+        metric_card = pygame.Rect(x + 12, 143, PANEL - 24, 34)
+        pygame.draw.rect(
+            self.screen, UI_SURFACE_RAISED, metric_card, border_radius=9
+        )
+        pygame.draw.rect(
+            self.screen, UI_BORDER, metric_card, 1, border_radius=9
+        )
+        self.text(
+            "LAP  •  SPEED  •  GEAR  •  ENERGY",
+            metric_card.center, "tiny", CYAN, anchor="center",
+        )
+        for row, car in enumerate(ranked[start:end]):
+            rank_index = start + row
+            y = 190 + row * 48
+            selected = self.replay_cars[self.replay_follow] is car
+            dnf = car.retirement_time is not None
+            row_rect = pygame.Rect(x + 10, y, PANEL - 20, 41)
+            pygame.draw.rect(
+                self.screen,
+                (37, 40, 41) if dnf else
+                UI_SURFACE_HOVER if selected else UI_SURFACE,
+                row_rect, border_radius=9,
+            )
+            pygame.draw.rect(
+                self.screen,
+                car.color if selected else UI_BORDER,
+                row_rect, 1, border_radius=9,
+            )
+            pygame.draw.rect(
+                self.screen, car.color,
+                (x + 15, y + 7, 5, 27), border_radius=2,
+            )
+            self.text(
+                f"{rank_index + 1:>2}", (x + 27, y + 10), "mono",
+                WHITE if selected else MUTED,
+            )
+            self.text(car.name[:10], (x + 57, y + 6), "mono", WHITE)
+            if dnf:
+                value = "DNF"
+            elif car.finish_time is not None:
+                value = "FINISHED"
+            elif car.generation == "Hybrid":
+                energy = (
+                    "REGEN" if car.recharge_active else
+                    "DEPLOY" if car.overtake_active or car.drs_active else
+                    f"{car.battery:.0f}%"
+                )
+                value = (
+                    f"L{car.lap + 1}  {car.speed_kph:.0f}  "
+                    f"G{car.gear}  {energy}"
+                )
+            else:
+                value = f"L{car.lap + 1}  {car.speed_kph:.0f}km/h  G{car.gear}"
+            self.text(
+                value, (x + 148, y + 22), "small",
+                CYAN if selected else MUTED,
+            )
+        if len(ranked) > 10:
+            self.text(
+                f"PAGE {page + 1}/{(len(ranked) - 1) // 10 + 1}",
+                (x + 20, 675), "small", MUTED,
+            )
+        self.footer_hint((
+            "UP/DOWN Driver  •  Click rows",
+            "J/K/L Transport  •  ESC Library",
+        ))
+
+    def replay(self, events, dt):
+        if not self.replay_data or not self.replay_cars:
+            self.mode = "replay_setup"
+            return
+        for event in events:
+            if self.handle_camera_zoom_event(event):
+                continue
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.mode = "replay_setup"
+                elif event.key == pygame.K_SPACE:
+                    self.toggle_replay_pause()
+                elif event.key == pygame.K_j:
+                    self.set_replay_transport(-1)
+                elif event.key == pygame.K_k:
+                    self.set_replay_transport(0)
+                elif event.key == pygame.K_l:
+                    self.set_replay_transport(1)
+                elif event.key == pygame.K_LEFT:
+                    self.replay_seek(-5.0)
+                elif event.key == pygame.K_RIGHT:
+                    self.replay_seek(5.0)
+                elif event.key == pygame.K_HOME:
+                    self.replay_time = self.replay_frame_times[0]
+                elif event.key == pygame.K_END:
+                    self.replay_time = self.replay_frame_times[-1]
+                elif event.key in (pygame.K_UP, pygame.K_DOWN):
+                    self.change_replay_focus(
+                        self.replay_ranked_cars(),
+                        -1 if event.key == pygame.K_UP else 1,
+                    )
+                elif event.key == pygame.K_LEFTBRACKET:
+                    self.adjust_camera_zoom(-1)
+                elif event.key == pygame.K_RIGHTBRACKET:
+                    self.adjust_camera_zoom(1)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                rects = self.replay_transport_rects()
+                if rects["rewind"].collidepoint(event.pos):
+                    self.set_replay_transport(-1)
+                elif rects["pause"].collidepoint(event.pos):
+                    self.toggle_replay_pause()
+                elif rects["forward"].collidepoint(event.pos):
+                    self.set_replay_transport(1)
+                elif rects["timeline"].inflate(0, 18).collidepoint(event.pos):
+                    fraction = clamp(
+                        (event.pos[0] - rects["timeline"].x)
+                        / rects["timeline"].width,
+                        0.0, 1.0,
+                    )
+                    start = self.replay_frame_times[0]
+                    self.replay_time = start + fraction * (
+                        self.replay_frame_times[-1] - start
+                    )
+                elif event.pos[0] >= CANVAS_W:
+                    ranked = self.replay_ranked_cars()
+                    page, start, end = self.race_tower_page_bounds(
+                        len(ranked), self.replay_tower_page
+                    )
+                    self.replay_tower_page = page
+                    row = self.race_tower_row(event.pos[1], end - start)
+                    if row is not None:
+                        selected = ranked[start + row]
+                        self.replay_follow = next(
+                            index for index, car in enumerate(self.replay_cars)
+                            if car is selected
+                        )
+
+        if self.replay_rate:
+            start = self.replay_frame_times[0]
+            end = self.replay_frame_times[-1]
+            next_time = self.replay_time + dt / 1000.0 * self.replay_rate
+            self.replay_time = clamp(next_time, start, end)
+            if next_time <= start or next_time >= end:
+                self.replay_resume_rate = self.replay_rate
+                self.replay_rate = 0.0
+        self.apply_replay_time()
+        ranked = self.replay_ranked_cars()
+        self.sync_replay_tower_page(ranked)
+        focused = self.replay_cars[self.replay_follow]
+        self.screen.fill(GRASS)
+        self.screen.set_clip(pygame.Rect(0, 0, CANVAS_W, HEIGHT))
+        camera_offset, camera_scale = self.camera_transform(focused.position)
+        self.replay_track.draw(self.screen, camera_offset, camera_scale)
+        for car in reversed(ranked):
+            if not car.removed_from_track:
+                car.draw(
+                    self.screen, car is focused,
+                    camera_offset, camera_scale,
+                )
+        self.screen.set_clip(None)
+        self.draw_minimap(
+            [car for car in self.replay_cars if not car.removed_from_track],
+            focused, track=self.replay_track,
+        )
+        self.draw_camera_zoom_control()
+        self.draw_replay_transport()
+        self.draw_replay_tower(ranked)
 
     def menu(self, events):
         self.draw_app_background()
@@ -5024,10 +5766,11 @@ class Game:
         )
         self.text("SELECT A WORKSPACE", (75, 154), "tiny", CYAN)
         cards = [
-            Button((70, 175, 535, 86), "1  Track Studio", "Draw and save a closed circuit"),
-            Button((675, 175, 535, 86), "2  AI Training", "Ghost agents share one start point"),
-            Button((70, 280, 535, 86), "3  Race Weekend", "Physical collisions, drafting and mixed brains"),
-            Button((675, 280, 535, 86), "4  Two-Lap Hotlap", "Choose one AI brain and record its time"),
+            Button((70, 170, 535, 74), "1  Track Studio", "Draw and save a closed circuit"),
+            Button((675, 170, 535, 74), "2  AI Training", "Ghost agents share one start point"),
+            Button((70, 260, 535, 74), "3  Race Weekend", "Physical collisions, drafting and mixed brains"),
+            Button((675, 260, 535, 74), "4  Two-Lap Hotlap", "Choose one AI brain and record its time"),
+            Button((70, 350, 1140, 64), "5  Replay Theatre", "Load recorded race JSON with full transport and driver cameras"),
         ]
         mouse = self.logical_mouse_position()
         if self.menu_ui_manager is None:
@@ -5035,7 +5778,7 @@ class Game:
                 card.draw(
                     self.screen, self.fonts, mouse, self.text
                 )
-        preview = pygame.Rect(70, 395, 1140, 235)
+        preview = pygame.Rect(70, 430, 1140, 200)
         self.glass_card(preview, accent=YELLOW, radius=18)
         pygame.draw.rect(
             self.screen, (24, 39, 37),
@@ -5082,7 +5825,8 @@ class Game:
         for event in events:
             target = None
             if event.type == pygame.KEYDOWN and event.key in (
-                pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
+            pygame.K_1, pygame.K_2, pygame.K_3, pygame.K_4,
+            pygame.K_5,
             ):
                 target = event.key - pygame.K_1
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
@@ -5134,6 +5878,11 @@ class Game:
                 self.mode = "race_setup"
             elif target == 3:
                 self.mode = "hotlap_setup"
+            elif target == 4:
+                choices = self.replay_choices()
+                if choices and self.selected_replay not in choices:
+                    self.selected_replay = choices[0]
+                self.mode = "replay_setup"
 
     def language_reference_docs(self):
         """Return the language reference for the selected powertrain."""
@@ -5608,7 +6357,7 @@ class Game:
             self.text(
                 (
                     f"Ln {current_line + 1}, Col {current_col + 1}"
-                    "  •  Ctrl/Cmd+S save  •  Tab/Shift+Tab indent"
+                    "  •  Ctrl/Cmd+C/X/V  •  Ctrl/Cmd+S save"
                 ),
                 (55, 701), "small", MUTED,
             )
@@ -6786,11 +7535,9 @@ class Game:
                 elif event.key == pygame.K_r:
                     self.reset_training(True)
                 elif event.key == pygame.K_s:
-                    champion = max(self.cars, key=lambda c: c.fitness)
-                    self.best_brain = champion.brain
                     self.open_name_dialog(
-                        "brain", "Export trained brain",
-                        f"Champion Gen {self.generation:03}",
+                        "brain", "Export all-time best brain",
+                        f"Champion Gen {self.best_generation:03}",
                         self.best_brain,
                     )
                 elif event.key == pygame.K_a:
@@ -6821,11 +7568,9 @@ class Game:
                         self.algorithm_source,
                     )
                 elif save_brain_rect.collidepoint(event.pos):
-                    champion = max(self.cars, key=lambda c: c.fitness)
-                    self.best_brain = champion.brain
                     self.open_name_dialog(
-                        "brain", "Export trained brain",
-                        f"Champion Gen {self.generation:03}",
+                        "brain", "Export all-time best brain",
+                        f"Champion Gen {self.best_generation:03}",
                         self.best_brain,
                     )
         if not self.paused:
@@ -7053,7 +7798,7 @@ class Game:
             )
         for rect, label, color in (
             (save_algorithm_rect, "SAVE CODE", (30, 57, 47)),
-            (save_brain_rect, "SAVE BRAIN", CYAN),
+            (save_brain_rect, "SAVE BEST", CYAN),
         ):
             pygame.draw.rect(self.screen, color, rect, border_radius=7)
             rendered = self.fonts["small"].render(
@@ -7065,6 +7810,11 @@ class Game:
             f"● {state}", (x, 673), "small",
             YELLOW if self.paused else (84, 220, 140),
         )
+        best_fitness = getattr(self, "best_fitness", None)
+        record = "BEST —" if best_fitness is None else (
+            f"BEST {best_fitness:.0f} • G{self.best_generation:03}"
+        )
+        self.text(record, (x + 91, 673), "small", CYAN)
         self.footer_hint(("[−/+] Agents  •  Wheel/[ ] Zoom", "[A] Code  •  [S] Brain"))
 
     def resolve_collisions(self, apply_damage=True):
@@ -8782,7 +9532,11 @@ class Game:
                     running = False
                 elif (
                     event.type == pygame.KEYDOWN
-                    and event.key == pygame.K_l
+                    and (
+                        event.key == pygame.K_F3
+                        or event.key == pygame.K_l
+                        and self.mode != "replay"
+                    )
                     and self.mode != "name_dialog"
                     and not event.mod & (
                         pygame.KMOD_CTRL | pygame.KMOD_ALT | pygame.KMOD_GUI
@@ -8806,6 +9560,10 @@ class Game:
                 self.hotlap_setup(events)
             elif self.mode == "hotlap":
                 self.hotlap(events, dt)
+            elif self.mode == "replay_setup":
+                self.replay_setup(events)
+            elif self.mode == "replay":
+                self.replay(events, dt)
             elif self.mode == "name_dialog":
                 self.draw_name_dialog(events)
             if self.show_fps:
