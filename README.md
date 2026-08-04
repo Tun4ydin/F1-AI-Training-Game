@@ -33,7 +33,7 @@ python main.py
 
 ## Controls
 
-- Menu: click a card or press `1`, `2`, `3`, or `4`
+- Menu: click a card or press `1`–`5`
 - Track editor: use tools `1`–`8` for route, kerb, sector, start/finish,
   pit entry, pit exit, pit road, and pit boxes. Pit Road remains locked until
   different Pit In and Pit Out route nodes exist. Its first authored node
@@ -96,8 +96,11 @@ python main.py
   mouse-wheel scrolling.
 - Training: click `-`/`+` or use the keyboard to change the live population,
   `Space` pauses, `R` evolves,
-  `A` or Save Code exports the current algorithm, and `S` or Save Brain exports
-  the current champion. The champion telemetry includes live green throttle and
+  `A` or Save Code exports the current algorithm, and `S` or Save Best exports
+  the all-time champion. A generation only replaces that elite brain when its
+  best car strictly exceeds the stored record fitness; ties and weaker
+  generations continue mutating from the retained elite. The champion telemetry
+  includes live green throttle and
   red brake percentage bars alongside speed, gear, and RPM. Fitness primarily
   measures real forward
   metres, while reversing, leaving the circuit, damage, and prolonged stalling
@@ -183,7 +186,9 @@ champion import/export,
 2–20 car races with per-car brain selection, physical oriented collision boxes,
 three-car-length slipstream and dirty-air cornering loss, timing tower, camera
 focus, laps, gaps, health, two-lap hotlaps, named component saves, saved-track
-selectors for every event type, and results.
+selectors for every event type, replay theatre, and results. Dense spline tracks
+use adaptive Catmull–Rom sampling so editor detail does not multiply physics and
+rendering work unnecessarily.
 
 The ICE and Hybrid defaults are the Agile Waypoint v2 controllers. They combine
 5/10/20/40 m waypoint anticipation with the nine-ray boundary fan, heading and
@@ -200,7 +205,11 @@ starting-grid reordering, generation, laps, dry/wet/changing weather, individual
 colours, fuel and starting tyres. Rain changes dry/wet tyre behavior. The user
 controller decides when to request a pit stop and which compound to fit; authored
 pit boxes perform the requested service. Replay JSON contains car positions,
-view focus, timing metric, weather and event history.
+view focus, timing metric, weather and event history. Saves use timestamped
+filenames and Replay Theatre can select any JSON recording in
+`saved_data/replays`. Playback interpolates recorded snapshots; `J/K/L` control
+rewind, pause and fast-forward, Left/Right seek five seconds, Space toggles
+pause, and Up/Down selects the previous/next classified driver.
 Replay car data also records powertrain, battery percentage, brake demand, and
 overtake deployment, plus speed, gear and RPM.
 
@@ -210,7 +219,3 @@ Install `requirements-build.txt`, then run `python build_release.py`. PyInstalle
 builds the native application for the current OS. The included GitHub Actions
 workflow builds Windows, macOS, and Linux artifacts when a `v*` tag is pushed or
 the workflow is started manually.
-
-The 2027 championship calendar cannot be bundled accurately yet because its
-official circuit calendar is future data. The track format supports adding
-preloaded circuits later without changing the simulation.

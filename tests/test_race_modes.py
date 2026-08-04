@@ -11,9 +11,9 @@ import pygame
 from pygame import Vector2
 
 from main import (
-    Brain, CAR_LENGTH_M, CAR_WIDTH_M, COLORS, DEFAULT_CAMERA_ZOOM, Car,
-    Game, OVERTAKE_REWARD, Track, component_filename, safe_component_name,
-    spawn_car,
+    Brain, CAR_LENGTH_M, CAR_WIDTH_M, COLORS, DEFAULT_CAMERA_ZOOM,
+    HYBRID_RECHARGE_RATE, Car, Game, OVERTAKE_REWARD, Track,
+    component_filename, safe_component_name, spawn_car,
 )
 from safe_algorithm import SafeAlgorithm
 
@@ -42,6 +42,43 @@ class RaceModeTests(unittest.TestCase):
         self.assertTrue(all(car.generation == "ICE" for car in game.cars))
         self.assertTrue(all(car.battery == 0.0 for car in game.cars))
 
+    def test_training_retains_all_time_brain_until_fitness_is_beaten(self):
+        game = object.__new__(Game)
+        game.track = self.track
+        game.population = 3
+        game.training_generation = "ICE"
+        game.training_racecraft = False
+        game.generation = 3
+        held_brain = Brain(config={"aggression": 0.41})
+        tied_brain = Brain(config={"aggression": 0.72})
+        game.best_brain = held_brain
+        game.best_fitness = 100.0
+        game.best_generation = 2
+        game.last_generation_fitness = None
+        game.last_generation_improved = False
+        game.cars = [
+            Car(Vector2(), 0, COLORS[0], tied_brain, fitness=100.0),
+            Car(Vector2(), 0, COLORS[1], Brain(), fitness=80.0),
+        ]
+
+        game.reset_training(evolve=True)
+
+        self.assertIs(game.best_brain, held_brain)
+        self.assertEqual(game.best_fitness, 100.0)
+        self.assertFalse(game.last_generation_improved)
+        self.assertIs(game.cars[0].brain, held_brain)
+
+        improved_brain = Brain(config={"aggression": 0.93})
+        game.cars[1].brain = improved_brain
+        game.cars[1].fitness = 125.0
+        game.reset_training(evolve=True)
+
+        self.assertIs(game.best_brain, improved_brain)
+        self.assertEqual(game.best_fitness, 125.0)
+        self.assertEqual(game.best_generation, 4)
+        self.assertTrue(game.last_generation_improved)
+        self.assertIs(game.cars[0].brain, improved_brain)
+
     def test_high_resolution_viewport_preserves_logical_coordinates(self):
         game = object.__new__(Game)
         game.window = pygame.Surface((1920, 1080))
@@ -59,6 +96,37 @@ class RaceModeTests(unittest.TestCase):
         self.assertIsNone(Game.race_tower_row(189.9, 12))
         self.assertIsNone(Game.race_tower_row(670.0, 12))
         self.assertIsNone(Game.race_tower_row(286.0, 2))
+
+    def test_race_camera_follows_classification_across_tower_pages(self):
+        game = object.__new__(Game)
+        game.cars = [
+            Car(
+                Vector2(index, 0), 0, COLORS[index % len(COLORS)],
+                Brain(), name=f"Driver {index + 1}",
+            )
+            for index in range(20)
+        ]
+        # The classification order deliberately differs from the cars list.
+        ranked = list(reversed(game.cars))
+        game.follow = game.cars.index(ranked[9])
+        game.race_tower_page = 0
+        game.event_camera = True
+
+        game.change_race_focus(ranked, 1)
+
+        self.assertIs(game.cars[game.follow], ranked[10])
+        self.assertEqual(game.race_tower_page, 1)
+        self.assertFalse(game.event_camera)
+
+        game.change_race_focus(ranked, -1)
+
+        self.assertIs(game.cars[game.follow], ranked[9])
+        self.assertEqual(game.race_tower_page, 0)
+
+    def test_race_tower_page_bounds_cover_second_ten_drivers(self):
+        self.assertEqual(Game.race_tower_page_bounds(20, 1), (1, 10, 20))
+        self.assertEqual(Game.race_tower_page_bounds(16, 1), (1, 10, 16))
+        self.assertEqual(Game.race_tower_page_bounds(8, 3), (0, 0, 8))
 
     def test_minimap_projection_preserves_aspect_and_stays_in_bounds(self):
         rect = pygame.Rect(12, 28, 196, 126)
@@ -79,6 +147,106 @@ class RaceModeTests(unittest.TestCase):
             and rect.top <= point.y <= rect.bottom
             for point in projected
         ))
+
+    def test_pitlane_containment_uses_local_spatial_segments(self):
+        track = self.track
+        self.assertGreaterEqual(len(track.pitlane_centerline), 2)
+        segment = len(track.pitlane_centerline) // 2
+        point = track.pitlane_centerline[segment].copy()
+        exact = track.pitlane_nearest(point)
+        local = track.pitlane_nearest(point, local_only=True)
+        self.assertAlmostEqual(local[0], exact[0], places=7)
+        self.assertEqual(local[2], exact[2])
+        self.assertTrue(track.is_in_pitlane(point))
+
+        cell = (
+            int(point.x // track.spatial_cell_m),
+            int(point.y // track.spatial_cell_m),
+        )
+        candidates = track.pitlane_spatial_segments[cell]
+        self.assertLess(
+            len(candidates), len(track.pitlane_centerline) - 1
+        )
+
+    def test_dense_spline_tracks_use_adaptive_sampling(self):
+        oval = Track.load(
+            ROOT / "saved_data" / "tracks" / "oval_002.json"
+        )
+        self.assertEqual(Track.spline_samples_per_section(12), 14)
+        self.assertEqual(oval.samples_per_section, 4)
+        self.assertEqual(len(oval.centerline), len(oval.points) * 4)
+        self.assertLess(len(oval.centerline), 300)
+
+    def test_replay_interpolates_position_and_wrapped_heading(self):
+        game = object.__new__(Game)
+        game.replay_track = Track(
+            [(0, 0), (100, 0), (100, 100), (0, 100)],
+            geometry="sampled",
+        )
+        game.replay_frame_times = [0.0, 1.0]
+        game.replay_time = 0.5
+        game.replay_data = {
+            "frames": [
+                {
+                    "time": 0.0,
+                    "cars": [{
+                        "name": "Replay Car", "x": 0.0, "y": 0.0,
+                        "angle": 350.0, "lap": 0, "speed_kph": 100.0,
+                    }],
+                },
+                {
+                    "time": 1.0,
+                    "cars": [{
+                        "name": "Replay Car", "x": 10.0, "y": 20.0,
+                        "angle": 10.0, "lap": 0, "speed_kph": 120.0,
+                    }],
+                },
+            ],
+        }
+        game.replay_cars = [
+            Car(Vector2(), 0, COLORS[0], Brain(), name="Replay Car")
+        ]
+
+        game.apply_replay_time()
+
+        self.assertEqual(game.replay_cars[0].position, Vector2(5, 10))
+        self.assertAlmostEqual(game.replay_cars[0].angle % 360, 0.0)
+        self.assertAlmostEqual(game.replay_cars[0].speed_kph, 120.0)
+
+    def test_replay_transport_accelerates_and_reverses(self):
+        game = object.__new__(Game)
+        game.replay_rate = 1.0
+        game.replay_resume_rate = 1.0
+
+        game.set_replay_transport(-1)
+        self.assertEqual(game.replay_rate, -1.0)
+        game.set_replay_transport(-1)
+        self.assertEqual(game.replay_rate, -2.0)
+        game.toggle_replay_pause()
+        self.assertEqual(game.replay_rate, 0.0)
+        game.toggle_replay_pause()
+        self.assertEqual(game.replay_rate, -2.0)
+        game.set_replay_transport(1)
+        self.assertEqual(game.replay_rate, 1.0)
+
+    def test_replay_camera_crosses_from_driver_ten_to_eleven(self):
+        game = object.__new__(Game)
+        game.replay_cars = [
+            Car(
+                Vector2(index, 0), 0,
+                COLORS[index % len(COLORS)], Brain(),
+                name=f"Replay {index + 1}", score=20 - index,
+            )
+            for index in range(20)
+        ]
+        ranked = game.replay_ranked_cars()
+        game.replay_follow = game.replay_cars.index(ranked[9])
+        game.replay_tower_page = 0
+
+        game.change_replay_focus(ranked, 1)
+
+        self.assertIs(game.replay_cars[game.replay_follow], ranked[10])
+        self.assertEqual(game.replay_tower_page, 1)
 
     def test_racecraft_training_uses_grid_drafting_and_collisions(self):
         game = object.__new__(Game)
@@ -444,7 +612,9 @@ class RaceModeTests(unittest.TestCase):
         turning.velocity = heading
         starting_angle = turning.angle
         turning.update(self.track)
-        self.assertGreater(abs(turning.angle - starting_angle), 3.7)
+        # Full lock at racing speed should now deliver the more agile
+        # steering response requested for tight and medium-speed corners.
+        self.assertGreater(abs(turning.angle - starting_angle), 4.2)
 
         settled_source = "steering = 0.0\nthrottle = 0.0\n"
         settled = spawn_car(
@@ -536,6 +706,59 @@ class RaceModeTests(unittest.TestCase):
         self.assertGreater(car.battery_regen, 0.0)
         self.assertLess(car.velocity.length(), previous_speed)
 
+    def test_tiny_lateral_velocity_stops_without_vector_scale_error(self):
+        source = (
+            "steering = 1.0\n"
+            "throttle = 0.0\n"
+            "brake = 0.0\n"
+        )
+        car = spawn_car(
+            self.track,
+            Brain(program=SafeAlgorithm(source), source=source),
+            COLORS[0],
+        )
+        heading = Vector2(1, 0).rotate(car.angle)
+        normal = Vector2(-heading.y, heading.x)
+        car.velocity = heading * 8e-7 + normal * 8e-7
+
+        car.update(self.track, damage_enabled=False)
+
+        self.assertEqual(car.velocity, Vector2())
+
+    def test_hybrid_recharge_scales_with_throttle_and_stops_at_zero(self):
+        def recharge_car(throttle):
+            source = (
+                "steering = 0.0\n"
+                f"throttle = {throttle}\n"
+                "brake = 0.0\n"
+                "recharge = 1.0\n"
+            )
+            car = spawn_car(
+                self.track,
+                Brain(program=SafeAlgorithm(source), source=source),
+                COLORS[0],
+            )
+            car.generation = "Hybrid"
+            car.battery = 20.0
+            car.update(self.track)
+            return car
+
+        idle = recharge_car(0.0)
+        half_throttle = recharge_car(0.5)
+        full_throttle = recharge_car(1.0)
+
+        self.assertTrue(idle.recharge_active)
+        self.assertEqual(idle.battery_regen, 0.0)
+        self.assertEqual(idle.battery, 20.0)
+        self.assertAlmostEqual(
+            half_throttle.battery_regen,
+            HYBRID_RECHARGE_RATE * 0.5,
+        )
+        self.assertAlmostEqual(
+            full_throttle.battery_regen,
+            HYBRID_RECHARGE_RATE,
+        )
+
     def test_ice_and_hybrid_use_distinct_era_silhouettes(self):
         ice_surface = pygame.Surface((260, 160), pygame.SRCALPHA)
         hybrid_surface = pygame.Surface((260, 160), pygame.SRCALPHA)
@@ -553,6 +776,26 @@ class RaceModeTests(unittest.TestCase):
             pygame.mask.from_surface(ice_surface).count(),
             pygame.mask.from_surface(hybrid_surface).count(),
         )
+
+    def test_car_sprite_rotation_is_reused_between_frames(self):
+        from main import _CAR_ROTATION_CACHE, _CAR_SPRITE_CACHE
+
+        _CAR_ROTATION_CACHE.clear()
+        _CAR_SPRITE_CACHE.clear()
+        surface = pygame.Surface((260, 160), pygame.SRCALPHA)
+        car = Car(
+            Vector2(16, 10), 13.0, (101, 149, 211), Brain(),
+            generation="Hybrid",
+        )
+        car.draw(surface, scale=8.0)
+        first_rotation_count = len(_CAR_ROTATION_CACHE)
+        first_base_count = len(_CAR_SPRITE_CACHE)
+        car.angle = 13.2
+        car.draw(surface, scale=8.0)
+        self.assertEqual(len(_CAR_ROTATION_CACHE), first_rotation_count)
+        self.assertEqual(len(_CAR_SPRITE_CACHE), first_base_count)
+        self.assertEqual(first_rotation_count, 1)
+        self.assertEqual(first_base_count, 1)
 
     def test_default_camera_keeps_car_art_readable_at_true_scale(self):
         surface = pygame.Surface((260, 160), pygame.SRCALPHA)
@@ -604,6 +847,33 @@ class RaceModeTests(unittest.TestCase):
         game.switch_training_generation("Hybrid")
         self.assertEqual(game.algorithm_source, "HYBRID DRAFT")
         self.assertEqual(game.algorithm_sources["ICE"], "ICE DRAFT")
+
+    def test_algorithm_editor_copy_and_multiline_system_paste(self):
+        game = object.__new__(Game)
+        game.algorithm_clipboard = ""
+        game._system_clipboard_ready = False
+        with patch("main.pygame.scrap.init") as scrap_init, patch(
+            "main.pygame.scrap.put"
+        ) as scrap_put, patch(
+            "main.pygame.scrap.get", return_value=b"brake = 0.2\r\nthrottle = 0.8\0"
+        ):
+            game.editor_set_clipboard("steering = -0.25")
+            scrap_init.assert_called_once_with()
+            scrap_put.assert_called_once_with(
+                pygame.SCRAP_TEXT, b"steering = -0.25\0"
+            )
+            self.assertEqual(
+                game.editor_get_clipboard(),
+                "brake = 0.2\nthrottle = 0.8",
+            )
+
+    def test_algorithm_editor_clipboard_falls_back_when_unavailable(self):
+        game = object.__new__(Game)
+        game.algorithm_clipboard = ""
+        game._system_clipboard_ready = False
+        with patch("main.pygame.scrap.init", side_effect=pygame.error("unavailable")):
+            game.editor_set_clipboard("overtake = 1")
+            self.assertEqual(game.editor_get_clipboard(), "overtake = 1")
 
     def test_training_brain_selector_defaults_to_empty_and_lists_saves(self):
         source = (

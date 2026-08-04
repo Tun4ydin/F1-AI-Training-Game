@@ -197,6 +197,34 @@ class TrainingRegressionTests(unittest.TestCase):
             Game.training_control_percentages(car), (100, 0)
         )
 
+    def test_training_hybrid_energy_infographic_states(self):
+        car = spawn_car(self.track, Brain(), COLORS[0])
+        car.generation = "Hybrid"
+        self.assertEqual(
+            Game.training_hybrid_energy_state(car)[:2],
+            ("READY", "0% ELEC"),
+        )
+        car.overtake_active = True
+        self.assertEqual(
+            Game.training_hybrid_energy_state(car)[:2],
+            ("DEPLOY", "+20% ELEC"),
+        )
+        car.drs_active = True
+        self.assertEqual(
+            Game.training_hybrid_energy_state(car)[:2],
+            ("M.O.M.", "+30% ELEC"),
+        )
+        car.battery_regen = 0.1
+        self.assertEqual(
+            Game.training_hybrid_energy_state(car)[:2],
+            ("REGEN", "HARVEST"),
+        )
+        car.recharge_active = True
+        self.assertEqual(
+            Game.training_hybrid_energy_state(car)[:2],
+            ("RECHARGE", "CHARGING"),
+        )
+
     def test_extended_ai_state_is_normalized_and_tracks_previous_action(self):
         self.assertEqual(set(Brain.INPUT_NAMES), SafeAlgorithm.INPUT_NAMES)
         source = (
@@ -391,6 +419,60 @@ class TrainingRegressionTests(unittest.TestCase):
         self.assertGreater(car.velocity.length(), 0.05)
         self.assertLess(car.battery, 100.0)
         self.assertTrue(car.alive)
+
+    def test_hybrid_controller_latches_recharge_from_ten_to_forty_percent(self):
+        program = SafeAlgorithm(self.hybrid_controller_source)
+        parameters = program.defaults()
+        base = {
+            "is_hybrid": 1.0,
+            "forward": 1.0,
+            "speed": 0.7,
+            "speed_kph": 280.0,
+            "rpm_value": 11000.0,
+            "traction": 1.0,
+        }
+
+        enters = program.run({
+            **base,
+            "battery": 0.09,
+            "battery_percent": 9.0,
+            "gear_number": 7.0,
+        }, parameters)
+        low_gear = program.run({
+            **base,
+            "battery": 0.09,
+            "battery_percent": 9.0,
+            "gear_number": 6.0,
+        }, parameters)
+        braking = program.run({
+            **base,
+            "battery": 0.09,
+            "battery_percent": 9.0,
+            "gear_number": 7.0,
+            "forward": 0.4,
+            "speed": 0.8,
+        }, parameters)
+        latched = program.run({
+            **base,
+            "battery": 0.30,
+            "battery_percent": 30.0,
+            "gear_number": 3.0,
+            "recharge_active": 1.0,
+        }, parameters)
+        released = program.run({
+            **base,
+            "battery": 0.41,
+            "battery_percent": 41.0,
+            "gear_number": 8.0,
+            "recharge_active": 1.0,
+        }, parameters)
+
+        self.assertEqual(enters[4], 1.0)
+        self.assertEqual(low_gear[4], 0.0)
+        self.assertGreater(braking[2], 0.0)
+        self.assertEqual(braking[4], 0.0)
+        self.assertEqual(latched[4], 1.0)
+        self.assertEqual(released[4], 0.0)
 
     def test_fallback_brain_uses_the_same_steering_convention(self):
         car = spawn_car(self.track, Brain(), COLORS[0], "Fallback Agent")

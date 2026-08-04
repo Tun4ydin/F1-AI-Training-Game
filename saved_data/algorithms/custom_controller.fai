@@ -95,11 +95,54 @@ if car_collision > 0.5 and passing > 0.5:
     steering = clamp(steering + passing_side * 0.25, -1.0, 1.0)
 
 # Hybrid energy strategy. ICE cars ignore overtake. Hybrid cars deploy the
-# electrical 30% only on open track and regenerate in braking zones.
+# electrical power only while accelerating straight. Braking, including
+# trail-braking while turning, is always reserved for regeneration.
+braking_zone_near = (
+    brake > 0.08
+    or forward < 0.32
+)
+recharge_entry = (
+    is_hybrid > 0.5
+    and recharge_active < 0.5
+    and battery < 0.70
+    and braking_zone_near > 0.5
+)
+recharge = 0.0
+if (
+    is_hybrid > 0.5
+    and recharge_active > 0.5
+    and battery < 1.0
+    and throttle <= 0.80
+):
+    recharge = 1.0
+if recharge_entry > 0.5:
+    recharge = 1.0
+    throttle = min(throttle, 0.80)
+
 overtake = 0.0
-if is_hybrid > 0.5 and battery > 0.18 and (
-    (forward > 0.72 and brake < 0.05)
-    or (passing > 0.5 and forward > 0.55)
+normal_deployment = (
+    throttle > 0.80
+    and abs(steering) <= 0.10
+)
+high_speed_turn_deployment = (
+    speed_kph > 150.0
+    and abs(steering) > 0.03
+    and throttle > 0.0
+    and brake <= 0.01
+)
+if (
+    is_hybrid > 0.5
+    and battery > 0.18
+    and recharge < 0.5
+    and brake <= 0.01
+    and (
+        (
+            normal_deployment > 0.5
+            and forward > 0.72
+        )
+        or high_speed_turn_deployment > 0.5
+        or (passing > 0.5 and forward > 0.55)
+    )
 ):
     overtake = 1.0
 
