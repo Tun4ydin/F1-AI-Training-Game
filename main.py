@@ -24,6 +24,8 @@ DISPLAY_WIDTH, DISPLAY_HEIGHT = 1920, 1080
 PANEL = 280
 CANVAS_W = WIDTH - PANEL
 FPS = 60
+TIMETABLE_REFRESH_HZ = 10
+TIMETABLE_REFRESH_MS = max(1, round(1000 / TIMETABLE_REFRESH_HZ))
 # All world geometry is measured in metres.
 ROAD_W = 12.0
 KERB_W = 14.0
@@ -275,7 +277,7 @@ class Track:
         self.road_widths_m = [
             clamp(
                 float(supplied_widths[i]) if i < len(supplied_widths) else base_width,
-                6.0, 24.0,
+                6.0, 44.0,
             )
             for i in range(len(self.points))
         ]
@@ -3380,9 +3382,14 @@ class Game:
         self._minimap_cache = {}
         self._native_text_commands = []
         self._native_font_cache = {}
+        # Every screen redraws text at the physical window resolution when
+        # enlarged. The world and panel shapes are smoothly scaled, while
+        # labels, the timetable and telemetry remain crisp on Retina/4K
+        # displays instead of being enlarged logical pixels.
         self.native_ui_modes = {
-            "menu", "editor", "algorithm", "race_setup",
-            "hotlap_setup", "replay_setup", "name_dialog",
+            "menu", "editor", "algorithm", "training", "race_setup",
+            "race", "hotlap_setup", "hotlap", "replay_setup", "replay",
+            "name_dialog",
         }
         self.viewport_scale = 1.0
         self.viewport_rect = pygame.Rect(0, 0, WIDTH, HEIGHT)
@@ -3433,6 +3440,8 @@ class Game:
         self.session_time = 0.0
         self.follow = 0
         self.race_tower_page = 0
+        self._race_tower_ranked = []
+        self._race_tower_next_refresh = 0
         self.message = ""
         self.message_until = 0
         self.metric = 0
@@ -3537,9 +3546,9 @@ class Game:
         self.menu_ui_manager = None
         self.menu_ui_buttons = []
         self.menu_ui_targets = {}
-        # The native card renderer carries subtitles, badges and richer hover
-        # feedback than a stock widget while still using pygame_gui elsewhere
-        # when a future screen needs its layout engine.
+        # Actually construct pygame_gui. Previously the setup method existed
+        # but was never called, so the library could not become active.
+        self.setup_menu_ui()
 
     def setup_menu_ui(self):
         """Build the first pygame_gui screen without affecting game drawing."""
@@ -3657,7 +3666,9 @@ class Game:
         viewport_size = self.viewport_rect.size
         native_ui = self.native_ui_rendering()
         if not native_ui:
-            pygame.transform.scale(
+            # Bilinear scaling avoids the blocky nearest-neighbour look that
+            # was especially visible on ultrawide, Retina and 4K displays.
+            pygame.transform.smoothscale(
                 self.screen,
                 viewport_size,
                 self._window_viewport_surface,
@@ -6525,7 +6536,7 @@ class Game:
         if not 0 <= index < len(self.editor_widths):
             return
         self.editor_widths[index] = clamp(
-            self.editor_widths[index] + delta, 6.0, 24.0
+            self.editor_widths[index] + delta, 6.0, 44.0
         )
         self.editor_road_width = (
             sum(self.editor_widths) / len(self.editor_widths)
@@ -6533,7 +6544,7 @@ class Game:
 
     def adjust_all_editor_widths(self, delta):
         self.editor_widths = [
-            clamp(width + delta, 6.0, 24.0)
+            clamp(width + delta, 6.0, 44.0)
             for width in self.editor_widths
         ]
         self.editor_grass_widths = [
@@ -6546,14 +6557,14 @@ class Game:
             self.editor_road_width = sum(self.editor_widths) / len(self.editor_widths)
         else:
             self.editor_road_width = clamp(
-                self.editor_road_width + delta, 6.0, 24.0
+                self.editor_road_width + delta, 6.0, 44.0
             )
 
     def adjust_all_editor_grass_widths(self, delta):
         self.editor_grass_widths = [
             clamp(
                 width + delta,
-                max(self.editor_widths[index] + 4.0, 16.0), 80.0,
+                max(self.editor_widths[index] + 4.0, 16.0), 120.0,
             )
             for index, width in enumerate(self.editor_grass_widths)
         ]
@@ -8993,9 +9004,19 @@ class Game:
                 if visible_indexes:
                     self.follow = random.choice(visible_indexes)
                 self.camera_until = pygame.time.get_ticks() + 30000
-        ranked = sorted(
-            self.cars, key=self.race_order_key, reverse=True
-        )
+        # Classification/gap presentation does not need a 60 Hz rebuild.
+        # Refreshing it at 10 Hz keeps movement readable while avoiding repeated
+        # sorting and timetable text churn every simulation frame.
+        now_ms = pygame.time.get_ticks()
+        if (
+            now_ms >= self._race_tower_next_refresh
+            or len(self._race_tower_ranked) != len(self.cars)
+        ):
+            self._race_tower_ranked = sorted(
+                self.cars, key=self.race_order_key, reverse=True
+            )
+            self._race_tower_next_refresh = now_ms + TIMETABLE_REFRESH_MS
+        ranked = self._race_tower_ranked
         if all(c.removed_from_track for c in self.cars):
             self.draw_results(ranked)
             return

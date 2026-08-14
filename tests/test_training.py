@@ -22,9 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class TrainingRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.track = Track.load(
-            ROOT / "saved_data" / "tracks" / "spa_francorchamps.json"
-        )
+        track_path = ROOT / "saved_data" / "tracks" / "spa_francorchamps.json"
+        if not track_path.exists():
+            track_path = ROOT / "saved_data" / "tracks" / "thespa4.json"
+        if not track_path.exists():
+            track_path = next((ROOT / "saved_data" / "tracks").glob("*.json"))
+        cls.track = Track.load(track_path)
         cls.controller_source = (
             ROOT / "saved_data" / "algorithms" / "custom_controller.fai"
         ).read_text()
