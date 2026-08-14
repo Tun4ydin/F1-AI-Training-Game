@@ -24,9 +24,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class RaceModeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.track = Track.load(
-            ROOT / "saved_data" / "tracks" / "spa_francorchamps.json"
-        )
+        track_path = ROOT / "saved_data" / "tracks" / "spa_francorchamps.json"
+        if not track_path.exists():
+            track_path = ROOT / "saved_data" / "tracks" / "thespa4.json"
+        if not track_path.exists():
+            track_path = next((ROOT / "saved_data" / "tracks").glob("*.json"))
+        cls.track = Track.load(track_path)
 
     def test_training_agents_are_ghosts_at_the_exact_same_spawn(self):
         game = object.__new__(Game)
