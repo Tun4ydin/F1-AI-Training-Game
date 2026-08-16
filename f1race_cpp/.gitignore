@@ -1,0 +1,6 @@
+build/
+saved_data/brains/*.json
+saved_data/replays/*.json
+saved_data/tracks/*.json
+saved_data/algorithms/*.fai
+!.gitkeep

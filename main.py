@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 from bisect import bisect_right
@@ -21,7 +22,7 @@ except ImportError:
 
 WIDTH, HEIGHT = 1280, 760
 DISPLAY_WIDTH, DISPLAY_HEIGHT = 1920, 1080
-PANEL = 280
+PANEL = 310
 CANVAS_W = WIDTH - PANEL
 FPS = 60
 TIMETABLE_REFRESH_HZ = 10
@@ -3256,6 +3257,29 @@ def spawn_car(
     return car
 
 
+_MENU_BUTTON_IMAGES = {}
+def _get_menu_button_bg(index, width, height):
+    names = ["track_studio.jpg", "ai_training.jpg", "race_weekend.jpg", "hotlap_clock.jpg", "replay_theatre.jpg"]
+    if index < 0 or index >= len(names):
+        return None
+    key = (index, width, height)
+    if key in _MENU_BUTTON_IMAGES:
+        return _MENU_BUTTON_IMAGES[key]
+    path = os.path.join(os.path.dirname(__file__), "assets", "menu", names[index])
+    if os.path.exists(path):
+        try:
+            surf = pygame.image.load(path).convert()
+            scaled = pygame.transform.smoothscale(surf, (width, height))
+            overlay = pygame.Surface((width, height), pygame.SRCALPHA)
+            overlay.fill((6, 16, 20, 160))
+            scaled.blit(overlay, (0, 0))
+            _MENU_BUTTON_IMAGES[key] = scaled
+            return scaled
+        except Exception:
+            return None
+    return None
+
+
 class Button:
     def __init__(self, rect, title, subtitle=""):
         self.rect = pygame.Rect(rect)
@@ -3277,6 +3301,12 @@ class Button:
             self.rect,
             border_radius=16,
         )
+        bg_img = _get_menu_button_bg(index, self.rect.width, self.rect.height)
+        if bg_img:
+            screen.blit(bg_img, self.rect.topleft)
+            hover_overlay = pygame.Surface((self.rect.width, self.rect.height), pygame.SRCALPHA)
+            hover_overlay.fill((0, 0, 0, 40) if hover else (0, 0, 0, 100))
+            screen.blit(hover_overlay, self.rect.topleft)
         pygame.draw.rect(
             screen,
             accent if hover else UI_BORDER,
@@ -4894,7 +4924,7 @@ class Game:
         try:
             pygame.scrap.init()
             self._system_clipboard_ready = True
-        except (pygame.error, TypeError):
+        except Exception:
             self._system_clipboard_ready = False
         return self._system_clipboard_ready
 
