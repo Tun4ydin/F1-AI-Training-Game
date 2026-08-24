@@ -441,6 +441,7 @@ struct Car {
     double rpm{4000},fitness{},bestLap{1e9},lapStart{},lastLap{},raceDistance{},forwardDistance{},reverseDistance{},offTrackFrames{},controlPenalty{},collisionPenalty{},lowSpeedSeconds{},finishTime{-1};
     double understeer{},oversteer{},traction{1},tireSlip{},angularVelocity{},slipstream{},batteryRegen{},drsGap{1e9},pitTimer{};
     double carAhead{},carAheadDistance{1},carAheadSide{},closingSpeed{},passingSide{},raceAggression{},aggressionError{},gapLeader{},gapNext{};
+    double apexDistance{1},apexCurvature{},longCurvature70{},longCurvature110{},longCurvature160{};
     double stagnantFrames{},aggressionMistakeFrames{},aggressionMistakeCooldown{};
     double pitExitStraightFrames{},pitExitGuidanceFrames{};
     int gear{1},lap{},checkpoint{},overtakes{},tyreCompound{},tyreLaps{},pitstops{},requestedTyre{1},startingPosition{1},racePosition{1},fieldSize{1},sensorFrame{},trackLimits{};
@@ -453,12 +454,14 @@ struct Car {
     void updateDrivetrain(double throttleValue){static constexpr std::array<double,8> ratios={3.20,2.55,2.08,1.72,1.45,1.25,1.16,.94};V2 heading{std::cos(angle),std::sin(angle)};double forwardSpeed=std::max(0.0,dot(velocity,heading)),ratio=clampv(forwardSpeed/1.67,0.0,1.0);gear=8;for(int i=0;i<8;++i)if(ratio<=std::min(1.0,.94/ratios[size_t(i)])){gear=i+1;break;}double low=gear==1?0:std::min(1.0,.94/ratios[size_t(gear-2)]),high=std::min(1.0,.94/ratios[size_t(gear-1)]),within=clampv((ratio-low)/std::max(1e-9,high-low),0.0,1.0);rpm=forwardSpeed<.025?4000+clampv(throttleValue,0.0,1.0)*2500:4000+within*9000;rpm=clampv(rpm,4000.0,13000.0);}
     double drivetrainPower()const{static constexpr std::array<double,8>ratios={3.20,2.55,2.08,1.72,1.45,1.25,1.16,.94};double strength=ratios[size_t(gear-1)]/ratios[0],rpmFraction=clampv((rpm-4000)/9000,0.0,1.0),redline=clampv((rpmFraction-.67)/.33,0.0,1.0);return(.10+strength*.90)*(1-.20*redline*redline);}
     std::array<double,9> raycasts(const Track&track)const{std::array<double,9>values{};static constexpr std::array<double,9>angles={-90,-70,-35,-18,0,18,35,70,90};for(size_t i=0;i<angles.size();++i){double a=angle+angles[i]*PI/180.0;V2 direction{std::cos(a),std::sin(a)};double previous=0,distance=4;for(;distance<=120;distance+=4){std::string surface=track.surface(position+direction*distance);if(surface!="asphalt"&&surface!="kerb"&&surface!="pitlane"){double lo=previous,hi=distance;for(int refine=0;refine<2;++refine){double mid=(lo+hi)*.5;std::string probe=track.surface(position+direction*mid);if(probe=="asphalt"||probe=="kerb"||probe=="pitlane")lo=mid;else hi=mid;}distance=lo;break;}previous=distance;}values[i]=std::min(distance,120.0)/120.0;}return values;}
+    // Scans the curvature profile ahead for the sharpest bend and reports how far away it is (0..1 over a 180m horizon, 1 = none found) and its signed severity (-1..1). Purely informational: brains may ignore it, aim for it, or build their own apex logic from the raw corner_curvature_* samples instead.
+    std::pair<double,double> findApex(const Track&track,double metres)const{double bestDistance=1.0,bestCurvature=0,bestMagnitude=0;constexpr double horizon=180.0,step=10.0,window=14.0;for(double d=step;d<=horizon;d+=step){double c=track.curvature(metres+d-window*.5,window);if(std::abs(c)>bestMagnitude){bestMagnitude=std::abs(c);bestDistance=d/horizon;bestCurvature=c;}}if(bestMagnitude<.12)return{1.0,0.0};return{bestDistance,bestCurvature};}
     std::unordered_map<std::string,double> controllerInputs(const Track&track,double rain){
-        auto projection=track.project(position);V2 tangent=unit(track.points[(projection.segment+1)%track.points.size()]-track.points[projection.segment]),heading{std::cos(angle),std::sin(angle)},localNormal=normal(heading);if(!raysReady||sensorFrame%3==0){rayCache=raycasts(track);raysReady=true;}++sensorFrame;double racingOffset=clampv(projection.lateral/std::max(1.0,track.widthAtProjection(projection)*.5),-1.0,1.0),headingError=std::atan2(cross(heading,tangent),dot(heading,tangent))/PI;
+        auto projection=track.project(position);V2 tangent=unit(track.points[(projection.segment+1)%track.points.size()]-track.points[projection.segment]),heading{std::cos(angle),std::sin(angle)},localNormal=normal(heading);if(!raysReady||sensorFrame%3==0){rayCache=raycasts(track);auto apex=findApex(track,projection.metres);apexDistance=apex.first;apexCurvature=apex.second;longCurvature70=track.curvature(projection.metres,70);longCurvature110=track.curvature(projection.metres,110);longCurvature160=track.curvature(projection.metres,160);raysReady=true;}++sensorFrame;double racingOffset=clampv(projection.lateral/std::max(1.0,track.widthAtProjection(projection)*.5),-1.0,1.0),headingError=std::atan2(cross(heading,tangent),dot(heading,tangent))/PI;
         std::unordered_map<std::string,double>v;auto put=[&](const char*n,double value){v[n]=value;};put("far_left",rayCache[1]);put("left",rayCache[2]);put("forward",rayCache[4]);put("right",rayCache[6]);put("far_right",rayCache[7]);put("heading_error",headingError);put("speed",clampv(length(velocity)/1.7,0.0,1.0));put("dirty_tyres",dirty/180);put("tyre_wear",wear);put("tyre_age",tyreLaps);put("fuel",clampv(fuel/110,0.0,1.0));put("fuel_kg",fuel);put("health",health/100);put("puncture",wear>=1.0);put("rain",rain);put("slipstream",slipstream);put("lap",lap);put("lap_progress",projection.metres/std::max(1.0,track.lengthM));put("pitstops",pitstops);put("pit_available",track.pitBoxes().empty()?0:1);for(int i=0;i<4;++i)put(i==0?"tyre_soft":i==1?"tyre_medium":i==2?"tyre_hard":"tyre_wet",tyreCompound==i);put("battery",hybrid?battery/100:0);put("battery_percent",hybrid?battery:0);put("regen",hybrid?clampv(batteryRegen/.46,0.0,1.0):0);put("is_hybrid",hybrid);put("overtake_active",deploying);put("recharge_active",regen);put("off_track",outsideLimits);put("car_collision",carCollision);put("understeer",understeer);put("oversteer",oversteer);put("racing_line_offset",racingOffset);put("car_ahead",carAhead);put("car_ahead_distance",carAheadDistance);put("car_ahead_side",carAheadSide);put("closing_speed",closingSpeed);put("passing",passing);put("passing_side",passingSide);put("local_velocity_forward",clampv(dot(velocity,heading)/1.67,-1.0,1.0));put("local_velocity_lateral",clampv(dot(velocity,localNormal)/1.67,-1.0,1.0));put("angular_velocity",clampv(angularVelocity/6,-1.0,1.0));put("traction",traction);put("tire_slip",tireSlip);put("rpm",rpm/13000);put("rpm_value",rpm);put("gear",gear/8.0);put("gear_number",gear);put("speed_kph",speed);put("ray_left_90",rayCache[0]);put("ray_left_18",rayCache[3]);put("ray_right_18",rayCache[5]);put("ray_right_90",rayCache[8]);
         static constexpr std::array<double,4>ahead={5,10,20,40};std::array<V2,4>waypoints;for(size_t i=0;i<ahead.size();++i){waypoints[i]=track.at(projection.metres+ahead[i]).first;V2 relative=waypoints[i]-position;put(("waypoint_"+std::to_string(int(ahead[i]))+"_forward").c_str(),clampv(dot(relative,heading)/ahead[i],-1.0,1.0));put(("waypoint_"+std::to_string(int(ahead[i]))+"_right").c_str(),clampv(dot(relative,localNormal)/ahead[i],-1.0,1.0));}
         for(size_t i=0;i<3;++i){std::string prefix="opponent_"+std::to_string(i+1);put((prefix+"_forward").c_str(),opponentData[i*4]);put((prefix+"_right").c_str(),opponentData[i*4+1]);put((prefix+"_velocity_forward").c_str(),opponentData[i*4+2]);put((prefix+"_velocity_right").c_str(),opponentData[i*4+3]);put((prefix+"_present").c_str(),opponentPresence[i]);}
-        put("previous_steering",steer);put("previous_throttle",throttle);put("previous_brake",brake);for(size_t i=1;i<4;++i){V2 chord=waypoints[i]-projection.point;double value=0;if(length(chord)>1e-9)value=clampv(std::atan2(cross(tangent,unit(chord)),dot(tangent,unit(chord)))*40/ahead[i],-1.0,1.0);put(("corner_curvature_"+std::to_string(int(ahead[i]))).c_str(),value);}put("race_position",racePosition);put("field_size",fieldSize);put("position_deficit",fieldSize>1?double(racePosition-1)/(fieldSize-1):0);put("gap_to_leader_m",gapLeader);put("gap_to_next_m",gapNext);put("race_aggression",raceAggression);put("aggression_error",aggressionError);put("progress",projection.metres/std::max(1.0,track.lengthM));put("drs_eligible",drsEligible);put("drs_active",drsActive);put("drs_in_zone",drsInZone);put("drs_gap",drsGap);put("track_limits",trackLimits);put("stagnant_frames",stagnantFrames);return v;
+        put("previous_steering",steer);put("previous_throttle",throttle);put("previous_brake",brake);for(size_t i=1;i<4;++i){V2 chord=waypoints[i]-projection.point;double value=0;if(length(chord)>1e-9)value=clampv(std::atan2(cross(tangent,unit(chord)),dot(tangent,unit(chord)))*40/ahead[i],-1.0,1.0);put(("corner_curvature_"+std::to_string(int(ahead[i]))).c_str(),value);}put("corner_curvature_70",longCurvature70);put("corner_curvature_110",longCurvature110);put("corner_curvature_160",longCurvature160);put("apex_distance",apexDistance);put("apex_curvature",apexCurvature);put("target_line_offset",clampv(apexCurvature*(1-2*apexDistance)*1.1,-1.0,1.0));put("race_position",racePosition);put("field_size",fieldSize);put("position_deficit",fieldSize>1?double(racePosition-1)/(fieldSize-1):0);put("gap_to_leader_m",gapLeader);put("gap_to_next_m",gapNext);put("race_aggression",raceAggression);put("aggression_error",aggressionError);put("progress",projection.metres/std::max(1.0,track.lengthM));put("drs_eligible",drsEligible);put("drs_active",drsActive);put("drs_in_zone",drsInZone);put("drs_gap",drsGap);put("track_limits",trackLimits);put("stagnant_frames",stagnantFrames);return v;
     }
     void update(const Track& track,double dt,double now,bool traffic=false,double draft=0,double rain=0,bool damageEnabled=true,std::mt19937* rng=nullptr,bool redFlagActive=false) {
         if(!alive||finished)return;
@@ -717,6 +720,7 @@ class App {
     int draggedPitNode{-1},selectedEditorNode{-1};bool selectedEditorPit{};std::string editorTool{"route"};
     bool editorPanning{}; int lastMouseX{},lastMouseY{};
     bool hybrid{true},racecraft{}; int population{20},raceCars{20},generation{},targetLaps{3}; double bestFitness{-1}; Brain champion;
+    int timingMetric{0};
     std::vector<RaceEntry> raceEntries;int selectedRaceEntry{};bool raceHybrid{true},raceTeams{};int raceWeather{};
     double rainLevel{};
     int lastWeatherLap{-1};double weatherForecast{.5},flagTimer{};std::string flagState{"GREEN"};
@@ -820,6 +824,7 @@ public:
         if(key==SDLK_DOWN&&cameraCount)focus=(focus+1)%cameraCount;
         if(key==SDLK_LEFTBRACKET)cameraZoom=std::max(MIN_CAMERA_ZOOM,cameraZoom/1.15);
         if(key==SDLK_RIGHTBRACKET)cameraZoom=std::min(MAX_CAMERA_ZOOM,cameraZoom*1.15);
+        if(mode==Mode::Training||mode==Mode::Race||mode==Mode::Hotlap){if(key==SDLK_LEFT)timingMetric=(timingMetric+8)%9;if(key==SDLK_RIGHT)timingMetric=(timingMetric+1)%9;}
         if(mode==Mode::TrackEditor){if(key==SDLK_c)clearTrackEditor();if(key==SDLK_s)saveTrack();if(key==SDLK_0)editorTool="pit_finish";if(key>=SDLK_1&&key<=SDLK_9){static const std::array<const char*,9> tools={"route","kerb","sector","start","pit_entry","pit_exit","pitlane","pit_box","delete"};editorTool=tools[size_t(key-SDLK_1)];}if(key==SDLK_MINUS||key==SDLK_KP_MINUS)track.adjustAllWidths(-0.5);if(key==SDLK_EQUALS||key==SDLK_KP_PLUS)track.adjustAllWidths(0.5);if(key==SDLK_LEFTBRACKET)track.adjustAllGrassWidths(-2.0);if(key==SDLK_RIGHTBRACKET)track.adjustAllGrassWidths(2.0);}
         if(mode==Mode::Training){if(key==SDLK_r)evolve();if(key==SDLK_s)saveChampion();if(key==SDLK_EQUALS||key==SDLK_KP_PLUS)changePopulation(1);if(key==SDLK_MINUS||key==SDLK_KP_MINUS)changePopulation(-1);}
         if(mode==Mode::Race&&key==SDLK_r)triggerRedFlag();
@@ -899,7 +904,9 @@ public:
     void saveTrack(){if(track.points.size()<3){notice="ADD AT LEAST 3 NODES";return;}if(!track.pitlanePoints.empty()&&!pitlaneReady()){notice="PIT ROAD NEEDS DIFFERENT PIT IN / OUT";return;}if(track.name.empty())track.name="Native Circuit";std::string filename;for(char raw:track.name){unsigned char c=static_cast<unsigned char>(raw);if(std::isalnum(c))filename.push_back(char(std::tolower(c)));else if(filename.empty()||filename.back()!='_')filename.push_back('_');}while(!filename.empty()&&filename.back()=='_')filename.pop_back();if(filename.empty())filename="native_circuit";fs::path p=localData()/"tracks"/(filename+".json");writeFile(p,track.toJson().dump(2));notice="SAVED "+p.filename().string();refreshFiles();}
     Car configuredCar(int i,bool stagger){
         static const std::array<const char*,20> names={"NOVA","APEX","VOLT","ZENITH","ORBIT","PULSE","COMET","ECHO","BLAZE","KITE","ONYX","RAPTOR","SOLAR","DRIFT","TITAN","FLUX","VEGA","STORM","RUNE","FROST"};
-        Car c;c.name=names[size_t(i)%names.size()];if(i>=int(names.size()))c.name+=" "+std::to_string(i+1);c.col=palette[size_t(i)%palette.size()];c.brain=i?chosenBrain.mutate(rng,.08):chosenBrain;c.hybrid=hybrid;c.battery=hybrid?100:0;double spacing=CAR_LENGTH_M+4.0;c.s=stagger?std::fmod(track.lengthM-i*spacing+track.lengthM,track.lengthM):0;c.lateral=stagger?((i%2)?-(CAR_WIDTH_M*.5+.75):(CAR_WIDTH_M*.5+.75)):0;auto [base,tangent]=track.at(c.s);const double coordinateMetres=track.geometryLength/std::max(1.0,track.lengthM);c.position=base+normal(tangent)*(c.lateral*coordinateMetres);c.angle=angleOf(tangent);c.previousProgress=c.s;c.raceDistance=stagger?-i*spacing:0;c.poseReady=true;return c;
+        Car c;c.name=names[size_t(i)%names.size()];if(i>=int(names.size()))c.name+=" "+std::to_string(i+1);c.col=palette[size_t(i)%palette.size()];c.brain=i?chosenBrain.mutate(rng,.08):chosenBrain;c.hybrid=hybrid;c.battery=hybrid?100:0;
+        // Mirrors the real standing-start grid (paired rows, side by side) rather than a single-file zigzag, so racecraft training actually rehearses the traffic shape cars meet at a real race start.
+        const int row=i/2,column=i%2;const double targetDistance=row*(CAR_LENGTH_M+8.0)+column*4.0;c.s=stagger?std::fmod(track.lengthM-targetDistance+track.lengthM,track.lengthM):0;double halfWidth=clampv(track.widthAt(0)*.20,CAR_WIDTH_M*.5+.55,std::max(CAR_WIDTH_M*.5+.55,track.widthAt(0)*.5-CAR_WIDTH_M*.5-.75));c.lateral=stagger?(column?-halfWidth:halfWidth):0;auto [base,tangent]=track.at(c.s);const double coordinateMetres=track.geometryLength/std::max(1.0,track.lengthM);c.position=base+normal(tangent)*(c.lateral*coordinateMetres);c.angle=angleOf(tangent);c.previousProgress=c.s;c.raceDistance=stagger?-targetDistance:0;c.poseReady=true;return c;
     }
     void resetCars(int count,bool stagger){cars.clear();cars.reserve(size_t(count));for(int i=0;i<count;++i)cars.push_back(configuredCar(i,stagger));focus=0;simTime=0;paused=false;}
     void changePopulation(int delta){
@@ -930,7 +937,7 @@ public:
             Car&c=cars[size_t(carIndex)];
             if(!c.alive||c.finished)continue;
             const int row=int(gridSlot)/2,column=int(gridSlot)%2;
-            const double targetDistance=row*(CAR_LENGTH_M+2.4)+column*2.8;
+            const double targetDistance=row*(CAR_LENGTH_M+8.0)+column*4.0;
             c.s=std::fmod(track.lengthM-targetDistance+track.lengthM,track.lengthM);
             double halfWidth=clampv(track.widthAt(0)*.20,CAR_WIDTH_M*.5+.55,std::max(CAR_WIDTH_M*.5+.55,track.widthAt(0)*.5-CAR_WIDTH_M*.5-.75));
             c.lateral=column?-halfWidth:halfWidth;
@@ -966,7 +973,7 @@ public:
         for(size_t i=0;i<cars.size();++i){
             RaceEntry&entry=raceEntries[i];Car&c=cars[i];c.name=entry.name.empty()?"UNNAMED":entry.name;c.col=palette[size_t(entry.colorIndex)%palette.size()];c.fuel=entry.fuel;c.tyreCompound=entry.tyre;c.startingPosition=int(i)+1;c.racePosition=int(i)+1;c.fieldSize=raceCars;
             if(entry.brainIndex==-2)c.brain=Brain{};else if(entry.brainIndex==-1)c.brain=chosenBrain;else if(entry.brainIndex>=0&&size_t(entry.brainIndex)<brainFiles.size())c.brain=Brain::load(brainFiles[size_t(entry.brainIndex)]);
-            const int row=int(i)/2,column=int(i)%2;const double targetDistance=row*(CAR_LENGTH_M+2.4)+column*2.8;c.s=std::fmod(track.lengthM-targetDistance+track.lengthM,track.lengthM);double halfWidth=clampv(track.widthAt(0)*.20,CAR_WIDTH_M*.5+.55,std::max(CAR_WIDTH_M*.5+.55,track.widthAt(0)*.5-CAR_WIDTH_M*.5-.75));c.lateral=column?-halfWidth:halfWidth;auto[base,tangent]=track.at(c.s);double scale=track.geometryLength/std::max(1.0,track.lengthM);c.position=base+normal(tangent)*(c.lateral*scale);c.angle=angleOf(tangent);c.previousProgress=c.s;c.raceDistance=-targetDistance;c.battery=hybrid?100:0;
+            const int row=int(i)/2,column=int(i)%2;const double targetDistance=row*(CAR_LENGTH_M+8.0)+column*4.0;c.s=std::fmod(track.lengthM-targetDistance+track.lengthM,track.lengthM);double halfWidth=clampv(track.widthAt(0)*.20,CAR_WIDTH_M*.5+.55,std::max(CAR_WIDTH_M*.5+.55,track.widthAt(0)*.5-CAR_WIDTH_M*.5-.75));c.lateral=column?-halfWidth:halfWidth;auto[base,tangent]=track.at(c.s);double scale=track.geometryLength/std::max(1.0,track.lengthM);c.position=base+normal(tangent)*(c.lateral*scale);c.angle=angleOf(tangent);c.previousProgress=c.s;c.raceDistance=-targetDistance;c.battery=hybrid?100:0;
         }
         capturedReplay.clear();replayCaptureAccumulator=0;replaySaved=false;countdown=5.0;cameraZoom=DEFAULT_CAMERA_ZOOM;mode=Mode::Race;
     }
@@ -986,9 +993,12 @@ public:
     }
     void updateTraffic(bool assistPassing){
         auto order=raceOrder();double leaderDistance=order.empty()?0:cars[size_t(order[0])].raceDistance;for(size_t rank=0;rank<order.size();++rank){Car&c=cars[size_t(order[rank])];c.racePosition=int(rank)+1;c.fieldSize=int(order.size());c.gapLeader=std::max(0.0,leaderDistance-c.raceDistance);c.gapNext=rank?std::max(0.0,cars[size_t(order[rank-1])].raceDistance-c.raceDistance):0;double deficit=order.size()>1?double(rank)/(order.size()-1):0;c.raceAggression=clampv(deficit*.48+clampv(c.gapLeader/(std::max(1.0,track.lengthM)*.18),0.0,1.0)*.22+clampv(c.gapNext/(std::max(1.0,track.lengthM)*.045),0.0,1.0)*.15+clampv(1-c.gapNext/65,0.0,1.0)*deficit*.10+clampv(double(c.lap)/std::max(1,targetLaps),0.0,1.0)*deficit*.05,0.0,1.0);c.drsGap=rank?c.gapNext/std::max(25.0,(cars[size_t(order[rank-1])].speed+c.speed)/7.2):1e9;}
-        for(size_t i=0;i<cars.size();++i){Car&f=cars[i];f.slipstream=0;f.carAhead=0;f.carAheadDistance=1;f.carAheadSide=0;f.closingSpeed=0;f.passing=false;f.passingSide=0;f.opponentData.fill(0);f.opponentPresence.fill(0);if(!f.alive||f.finished)continue;V2 heading{std::cos(f.angle),std::sin(f.angle)},side=normal(heading);struct Nearby{double distance;size_t index;double forward,right,vforward,vright;};std::vector<Nearby>nearby;double nearestAhead=1e9;size_t target=cars.size();for(size_t j=0;j<cars.size();++j)if(i!=j&&cars[j].alive&&!cars[j].finished){V2 relative=cars[j].position-f.position,relativeVelocity=cars[j].velocity-f.velocity;double distance=dot(relative,relative);if(distance<=1600)nearby.push_back({distance,j,clampv(dot(relative,heading)/40,-1.0,1.0),clampv(dot(relative,side)/40,-1.0,1.0),clampv(dot(relativeVelocity,heading)/1.67,-1.0,1.0),clampv(dot(relativeVelocity,side)/1.67,-1.0,1.0)});double longitudinal=dot(relative,heading),lateral=dot(relative,side);V2 otherHeading{std::cos(cars[j].angle),std::sin(cars[j].angle)};if(longitudinal>0&&longitudinal<=CAR_LENGTH_M*5&&std::abs(lateral)<=track.widthAt(f.s)*.65&&dot(heading,otherHeading)>=.82&&longitudinal<nearestAhead){nearestAhead=longitudinal;target=j;}if(longitudinal>CAR_LENGTH_M*.75&&longitudinal<=CAR_LENGTH_M*3&&std::abs(lateral)<CAR_WIDTH_M*1.3&&dot(heading,otherHeading)>.94){double strength=clampv((CAR_LENGTH_M*3-longitudinal)/(CAR_LENGTH_M*2.25),0.0,1.0)*(1-std::abs(lateral)/(CAR_WIDTH_M*1.3));f.slipstream=std::max(f.slipstream,strength);}}
+        for(size_t i=0;i<cars.size();++i){Car&f=cars[i];f.slipstream=0;f.carAhead=0;f.carAheadDistance=1;f.carAheadSide=0;f.closingSpeed=0;f.passing=false;f.opponentData.fill(0);f.opponentPresence.fill(0);if(!f.alive||f.finished){f.passingSide=0;continue;}V2 heading{std::cos(f.angle),std::sin(f.angle)},side=normal(heading);struct Nearby{double distance;size_t index;double forward,right,vforward,vright;};std::vector<Nearby>nearby;double nearestAhead=1e9;size_t target=cars.size();for(size_t j=0;j<cars.size();++j)if(i!=j&&cars[j].alive&&!cars[j].finished){V2 relative=cars[j].position-f.position,relativeVelocity=cars[j].velocity-f.velocity;double distance=dot(relative,relative);if(distance<=1600)nearby.push_back({distance,j,clampv(dot(relative,heading)/40,-1.0,1.0),clampv(dot(relative,side)/40,-1.0,1.0),clampv(dot(relativeVelocity,heading)/1.67,-1.0,1.0),clampv(dot(relativeVelocity,side)/1.67,-1.0,1.0)});double longitudinal=dot(relative,heading),lateral=dot(relative,side);V2 otherHeading{std::cos(cars[j].angle),std::sin(cars[j].angle)};if(longitudinal>0&&longitudinal<=CAR_LENGTH_M*5&&std::abs(lateral)<=track.widthAt(f.s)*.65&&dot(heading,otherHeading)>=.82&&longitudinal<nearestAhead){nearestAhead=longitudinal;target=j;}if(longitudinal>CAR_LENGTH_M*.75&&longitudinal<=CAR_LENGTH_M*3&&std::abs(lateral)<CAR_WIDTH_M*1.3&&dot(heading,otherHeading)>.94){double strength=clampv((CAR_LENGTH_M*3-longitudinal)/(CAR_LENGTH_M*2.25),0.0,1.0)*(1-std::abs(lateral)/(CAR_WIDTH_M*1.3));f.slipstream=std::max(f.slipstream,strength);}}
             std::sort(nearby.begin(),nearby.end(),[](const Nearby&a,const Nearby&b){return a.distance<b.distance;});for(size_t n=0;n<std::min<size_t>(3,nearby.size());++n){f.opponentData[n*4]=nearby[n].forward;f.opponentData[n*4+1]=nearby[n].right;f.opponentData[n*4+2]=nearby[n].vforward;f.opponentData[n*4+3]=nearby[n].vright;f.opponentPresence[n]=1;}
-            if(target<cars.size()){Car&lead=cars[target];V2 relative=lead.position-f.position;double lateral=dot(relative,side);f.carAhead=1;f.carAheadDistance=clampv(nearestAhead/(CAR_LENGTH_M*5),0.0,1.0);f.carAheadSide=clampv(lateral/std::max(1.0,track.widthAt(f.s)*.5),-1.0,1.0);f.closingSpeed=clampv((dot(f.velocity,heading)-dot(lead.velocity,heading))/1.67,-1.0,1.0);if(assistPassing&&nearestAhead<=CAR_LENGTH_M*4&&f.closingSpeed>.035){double leftRoom=f.rayCache[2]+f.rayCache[1]*.35,rightRoom=f.rayCache[6]+f.rayCache[7]*.35;f.passing=true;f.passingSide=lateral>CAR_WIDTH_M*.4?-1:lateral<-CAR_WIDTH_M*.4?1:(rightRoom>=leftRoom?1:-1);}}
+            if(target<cars.size()){Car&lead=cars[target];V2 relative=lead.position-f.position;double lateral=dot(relative,side);f.carAhead=1;f.carAheadDistance=clampv(nearestAhead/(CAR_LENGTH_M*5),0.0,1.0);f.carAheadSide=clampv(lateral/std::max(1.0,track.widthAt(f.s)*.5),-1.0,1.0);f.closingSpeed=clampv((dot(f.velocity,heading)-dot(lead.velocity,heading))/1.67,-1.0,1.0);
+                // Committed side with hysteresis: once passingSide is chosen, only the wider band flips it back, so a centered lead car doesn't cause frame-to-frame left/right flicker (visible as swerving).
+                if(assistPassing&&nearestAhead<=CAR_LENGTH_M*4&&f.closingSpeed>.035){double leftRoom=f.rayCache[2]+f.rayCache[1]*.35,rightRoom=f.rayCache[6]+f.rayCache[7]*.35;f.passing=true;double band=CAR_WIDTH_M*(f.passingSide!=0?.9:.4);double desired=lateral>band?-1:lateral<-band?1:0;if(desired!=0)f.passingSide=desired;else if(f.passingSide==0)f.passingSide=rightRoom>=leftRoom?1:-1;}else f.passingSide=0;
+            }else f.passingSide=0;
         }
     }
     void armOvertakes(){for(size_t i=0;i<cars.size();++i){Car&f=cars[i];for(auto it=f.overtakeCooldowns.begin();it!=f.overtakeCooldowns.end();){if(--it->second<=0)it=f.overtakeCooldowns.erase(it);else++it;}if(f.carCollision||!f.alive)f.overtakeCandidates.clear();V2 heading{std::cos(f.angle),std::sin(f.angle)},side=normal(heading);for(size_t j=0;j<cars.size();++j)if(i!=j&&!f.overtakeCooldowns.count(int(j))&&cars[j].alive){V2 relative=cars[j].position-f.position;double longitudinal=dot(relative,heading),lateral=dot(relative,side);V2 oh{std::cos(cars[j].angle),std::sin(cars[j].angle)};if(longitudinal>CAR_LENGTH_M*.75&&longitudinal<=CAR_LENGTH_M*5&&std::abs(lateral)<track.widthAt(f.s)*.5&&dot(heading,oh)>.78&&dot(f.velocity,heading)>dot(cars[j].velocity,heading)+.02)f.overtakeCandidates.insert(int(j));}}}
@@ -1121,10 +1131,10 @@ public:
             float previewHeight=display.y<800?72.0f:clampv(display.y*.17f,100.0f,155.0f);ImVec2 previewPos=ImGui::GetCursorScreenPos();ImVec2 previewSize{ImGui::GetContentRegionAvail().x,previewHeight};ImGui::InvisibleButton("##track-preview",previewSize);dl=ImGui::GetWindowDrawList();dl->AddRectFilled(previewPos,{previewPos.x+previewSize.x,previewPos.y+previewSize.y},IM_COL32(4,19,23,230),8);if(track.points.size()>1){double minx=track.points[0].x,maxx=minx,miny=track.points[0].y,maxy=miny;for(V2 p:track.points){minx=std::min(minx,p.x);maxx=std::max(maxx,p.x);miny=std::min(miny,p.y);maxy=std::max(maxy,p.y);}double ps=std::min((previewSize.x-28)/std::max(1.0,maxx-minx),(previewSize.y-18)/std::max(1.0,maxy-miny));double ox=previewPos.x+(previewSize.x-(maxx-minx)*ps)*.5-minx*ps,oy=previewPos.y+(previewSize.y-(maxy-miny)*ps)*.5-miny*ps;for(size_t i=0;i<track.points.size();++i){V2 a=track.points[i],b=track.points[(i+1)%track.points.size()];ImVec2 ia{float(ox+a.x*ps),float(oy+a.y*ps)},ib{float(ox+b.x*ps),float(oy+b.y*ps)};dl->AddLine(ia,ib,IM_COL32(30,39,43,255),9);dl->AddLine(ia,ib,IM_COL32(94,106,111,255),4);}}ImGui::Separator();
             ImGui::TextColored({.29f,.64f,1,1},"RACE WEEKEND DEFAULTS");ImGui::TextDisabled("Race cars / target laps");ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x*.48f);ImGui::SliderInt("##race-grid",&raceCars,2,20);ImGui::SameLine();ImGui::SetNextItemWidth(-1);ImGui::SliderInt("##race-laps",&targetLaps,1,20);
             ImGui::Separator();ImGui::TextWrapped("AI Training has its own setup workspace, matching the Python version. Open it to select the algorithm, track, powertrain, racecraft mode and base brain.");
-            ImGui::End();return;
+            ImGui::End();drawKeyHints();return;
         }
         if(mode==Mode::Algorithm){
-            ImGui::SetNextWindowPos(pos(24,82));ImGui::SetNextWindowSize(size(1552,794));
+            ImGui::SetNextWindowPos(pos(24,82));ImGui::SetNextWindowSize(size(1552,776));
             ImGui::Begin("AI Training Setup",nullptr,fixed);
             ImGui::TextColored({.27f,.88f,.76f,1},"EVOLUTION LAB");ImGui::SameLine();ImGui::TextDisabled("Configure the session, edit the controller, then run training.");
             if(ImGui::BeginTable("training-selectors",4,ImGuiTableFlags_SizingStretchSame)){
@@ -1164,8 +1174,10 @@ public:
                 ImGui::BulletText("heading_error (-1 left .. +1 right)");
                 ImGui::BulletText("racing_line_offset (-1 left .. +1 right)");
                 ImGui::BulletText("lap, lap_progress (0..1), progress");
-                ImGui::BulletText("corner_curvature_10, _20, _40 (-1..1)");
+                ImGui::BulletText("corner_curvature_10, _20, _40, _70, _110, _160 (-1..1)");
                 ImGui::BulletText("waypoint_5/10/20/40_forward / _right");
+                ImGui::BulletText("apex_distance (0 near..1 none in 180m), apex_curvature (-1..1)");
+                ImGui::BulletText("target_line_offset (-1..1): suggested in-out-in racing line, optional to use");
                 ImGui::BulletText("drs_eligible, drs_active, drs_in_zone, drs_gap");
                 ImGui::TextDisabled("Opponents & Racecraft:");
                 ImGui::BulletText("opponent_1/2/3_forward, _right");
@@ -1213,10 +1225,10 @@ public:
                 ImGui::EndChild();ImGui::EndTable();
             }
                 if(ImGui::Button("RELOAD",{120,44}))loadAlgorithm();ImGui::SameLine();if(ImGui::Button("SAVE CODE",{150,44}))saveAlgorithm();ImGui::SameLine();if(ImGui::Button("BACK",{110,44}))mode=Mode::Menu;ImGui::SameLine();ImGui::SetCursorPosX(ImGui::GetWindowWidth()-245);if(ImGui::Button("RUN TRAINING",{220,44}))startTraining();
-            ImGui::End();return;
+            ImGui::End();drawKeyHints();return;
         }
         if(mode==Mode::TrackEditor){
-            ImGui::SetNextWindowPos(pos(1185,88));ImGui::SetNextWindowSize(size(395,775));ImGui::Begin("Track tools",nullptr,fixed);
+            ImGui::SetNextWindowPos(pos(1185,88));ImGui::SetNextWindowSize(size(395,768));ImGui::Begin("Track tools",nullptr,fixed);
             ImGui::TextColored({.27f,.88f,.76f,1},"TRACK STUDIO");ImGui::SetNextItemWidth(-1);ImGui::InputText("##track-name",&track.name);
             float topHalf=(ImGui::GetContentRegionAvail().x-6.0f)*0.5f;
             if(ImGui::Button("SAVE TRACK",{topHalf,38}))saveTrack();ImGui::SameLine();
@@ -1278,11 +1290,11 @@ public:
             ImGui::Separator();
             ImGui::TextDisabled("S save  •  C clear  •  +/- all road  •  [/] all grass");
             if(ImGui::Button("BACK TO MENU",{-1,36}))mode=Mode::Menu;
-            ImGui::End();return;
+            ImGui::End();drawKeyHints();return;
         }
         if(mode==Mode::RaceSetup){
             ensureRaceEntries();raceCars=clampv(raceCars,2,20);selectedRaceEntry=clampv(selectedRaceEntry,0,raceCars-1);
-            ImGui::SetNextWindowPos(pos(28,86));ImGui::SetNextWindowSize(size(760,782));ImGui::Begin("Starting grid",nullptr,fixed);
+            ImGui::SetNextWindowPos(pos(28,86));ImGui::SetNextWindowSize(size(760,768));ImGui::Begin("Starting grid",nullptr,fixed);
             ImGui::TextColored({.27f,.88f,.76f,1},"RACE WEEKEND");ImGui::TextDisabled("Click a driver to configure it. Use Grid Up/Down to change starting order.");
             if(ImGui::BeginTable("race-roster",2,ImGuiTableFlags_SizingStretchSame|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_ScrollY,{-1,-1})){
                 const std::array<const char*,4> tyreShort={"S","M","H","W"};
@@ -1299,7 +1311,7 @@ public:
                 }
                 ImGui::EndTable();
             }ImGui::End();
-            ImGui::SetNextWindowPos(pos(806,86));ImGui::SetNextWindowSize(size(766,782));ImGui::Begin("Pre-race setup",nullptr,fixed);
+            ImGui::SetNextWindowPos(pos(806,86));ImGui::SetNextWindowSize(size(766,768));ImGui::Begin("Pre-race setup",nullptr,fixed);
             ImGui::TextColored({.29f,.64f,1,1},"CIRCUIT");ImGui::SetNextItemWidth(-1);
             if(ImGui::BeginCombo("##race-track",track.name.c_str())){for(size_t i=0;i<trackFiles.size();++i){Track preview;std::string label=trackFiles[i].stem().string();if(preview.load(trackFiles[i]))label=preview.name;if(ImGui::Selectable(label.c_str(),i==trackIndex))loadTrack(i);}ImGui::EndCombo();}
             ImGui::Separator();ImGui::TextColored({.27f,.88f,.76f,1},"SESSION");
@@ -1325,10 +1337,10 @@ public:
             if(ImGui::Button("BACK TO MENU",{botHalf,44}))mode=Mode::Menu;
             ImGui::SameLine();
             if(ImGui::Button("START RACE",{-1,44}))startRace();
-            ImGui::End();return;
+            ImGui::End();drawKeyHints();return;
         }
         if(mode==Mode::HotlapSetup){
-            ImGui::SetNextWindowPos(pos(48,88));ImGui::SetNextWindowSize(size(965,775));ImGui::Begin("Circuit preview",nullptr,fixed);
+            ImGui::SetNextWindowPos(pos(48,88));ImGui::SetNextWindowSize(size(965,766));ImGui::Begin("Circuit preview",nullptr,fixed);
             ImGui::TextColored({.27f,.88f,.76f,1},"TWO-LAP HOTLAP");ImGui::Text("One brain. One circuit. Two timed laps.");
             ImGui::TextDisabled("The clock starts from rest and stops when lap two is completed.");
             ImVec2 previewPos=ImGui::GetCursorScreenPos(),previewSize=ImGui::GetContentRegionAvail();
@@ -1347,7 +1359,7 @@ public:
                 }
             }
             ImGui::End();
-            ImGui::SetNextWindowPos(pos(1030,88));ImGui::SetNextWindowSize(size(525,775));ImGui::Begin("Run configuration",nullptr,fixed);
+            ImGui::SetNextWindowPos(pos(1030,88));ImGui::SetNextWindowSize(size(525,766));ImGui::Begin("Run configuration",nullptr,fixed);
             ImGui::TextColored({1,.79f,.29f,1},"01  CIRCUIT");ImGui::SetNextItemWidth(-1);
             if(ImGui::BeginCombo("##hotlap-track",track.name.c_str())){for(size_t i=0;i<trackFiles.size();++i){Track preview;std::string label=trackFiles[i].stem().string();if(preview.load(trackFiles[i]))label=preview.name;if(ImGui::Selectable(label.c_str(),i==trackIndex))loadTrack(i);}ImGui::EndCombo();}
             ImGui::Text("%.3f km  •  2 timed laps",track.lengthM/1000.0);
@@ -1364,10 +1376,10 @@ public:
             if(ImGui::Button("BACK",{hlHalf,44}))mode=Mode::Menu;
             ImGui::SameLine();
             if(ImGui::Button("START RUN",{-1,44}))startHotlap();
-            ImGui::End();return;
+            ImGui::End();drawKeyHints();return;
         }
         if(mode==Mode::ReplaySetup){
-            ImGui::SetNextWindowPos(pos(100,90));ImGui::SetNextWindowSize(size(1400,775));ImGui::Begin("Replay Theatre",nullptr,fixed);
+            ImGui::SetNextWindowPos(pos(100,90));ImGui::SetNextWindowSize(size(1400,760));ImGui::Begin("Replay Theatre",nullptr,fixed);
             ImGui::TextColored({.70f,.40f,1,1},"SAVED JSON REPLAYS");
             float listWidth=ImGui::GetContentRegionAvail().x*.65f;
             ImGui::BeginChild("replays",{listWidth,-1},true);
@@ -1385,13 +1397,13 @@ public:
             if(ImGui::Button("PLAY SELECTED",{-1,48}))startReplay();
             if(ImGui::Button("BACK TO MENU",{-1,40}))mode=Mode::Menu;
             ImGui::EndGroup();
-            ImGui::End();return;
+            ImGui::End();drawKeyHints();return;
         }
         // Native overlays for all moving sessions; the circuit and cars remain
         // on the SDL renderer underneath while every interactive HUD is ImGui.
         if(mode!=Mode::Replay){
             const char* sessionName=mode==Mode::Training?"AI Evolution Lab":mode==Mode::Race?"Race Control & Timing":"Two-Lap Hotlap Timing";
-            ImGui::SetNextWindowPos(pos(16,88));ImGui::SetNextWindowSize(size(415,622));
+            ImGui::SetNextWindowPos(pos(16,88));ImGui::SetNextWindowSize(size(560,622));
             ImGui::Begin(sessionName,nullptr,fixed);
             if(mode==Mode::Training){
                 ImGui::TextColored({.27f,.88f,.76f,1},"GEN %d",generation);ImGui::SameLine();
@@ -1420,14 +1432,23 @@ public:
             ImGui::TextDisabled("%s  •  %s",track.name.c_str(),hybrid?"HYBRID":"ICE");
             ImGui::Separator();
             auto order=raceOrder();
-            if(ImGui::BeginTable("timing",6,ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY|ImGuiTableFlags_SizingStretchProp|ImGuiTableFlags_BordersInnerH,{-1,-1})){
+            // Timing tower data page: mirrors the Python HUD's cyclable metric strip (LEFT/RIGHT to page through it, UP/DOWN to change driver) as an extra column alongside the always-on ones above, rather than replacing them.
+            static const std::array<const char*,9> towerLabels={"INTERVAL","GAP TO LEADER","TYRE / AGE","PIT STOPS","CONDITION","BATTERY / ENERGY","FUEL / PIT CALL","SPEED / GEAR / RPM","AGGRESSION / RISK"};
+            {
+                std::string pill=std::string("\xe2\x80\xb9  ")+towerLabels[size_t(timingMetric)]+"  \xe2\x80\xba";
+                float pillWidth=ImGui::CalcTextSize(pill.c_str()).x;
+                ImGui::SetCursorPosX(std::max(4.0f,(ImGui::GetContentRegionAvail().x-pillWidth)*.5f));
+                ImGui::TextColored({.42f,.85f,1,1},"%s",pill.c_str());
+            }
+            if(ImGui::BeginTable("timing",7,ImGuiTableFlags_RowBg|ImGuiTableFlags_ScrollY|ImGuiTableFlags_SizingStretchProp|ImGuiTableFlags_BordersInnerH,{-1,-1})){
                 ImGui::TableSetupScrollFreeze(0,1);
-                ImGui::TableSetupColumn("#",ImGuiTableColumnFlags_WidthFixed,26);
+                ImGui::TableSetupColumn("#",ImGuiTableColumnFlags_WidthFixed,24);
                 ImGui::TableSetupColumn("DRIVER",ImGuiTableColumnFlags_WidthStretch,1.4f);
-                ImGui::TableSetupColumn("TYRE",ImGuiTableColumnFlags_WidthFixed,62);
-                ImGui::TableSetupColumn("KM/H",ImGuiTableColumnFlags_WidthFixed,50);
-                ImGui::TableSetupColumn(hybrid?"MODE":"GEAR",ImGuiTableColumnFlags_WidthFixed,62);
-                ImGui::TableSetupColumn("STATUS/GAP",ImGuiTableColumnFlags_WidthFixed,82);
+                ImGui::TableSetupColumn("TYRE",ImGuiTableColumnFlags_WidthFixed,58);
+                ImGui::TableSetupColumn("KM/H",ImGuiTableColumnFlags_WidthFixed,48);
+                ImGui::TableSetupColumn(hybrid?"MODE":"GEAR",ImGuiTableColumnFlags_WidthFixed,58);
+                ImGui::TableSetupColumn("STATUS/GAP",ImGuiTableColumnFlags_WidthFixed,78);
+                ImGui::TableSetupColumn("TOWER",ImGuiTableColumnFlags_WidthFixed,104);
                 ImGui::TableHeadersRow();
                 static const std::array<const char*,4> tyreLetters={"S","M","H","W"};
                 static const std::array<ImVec4,4> tyreColors={ImVec4(1,.25f,.30f,1),ImVec4(1,.80f,.25f,1),ImVec4(.95f,.95f,.95f,1),ImVec4(.30f,.65f,1,1)};
@@ -1464,6 +1485,20 @@ public:
                     else if(rank==0) ImGui::TextColored({.27f,.88f,.76f,1},"LEADER");
                     else if(c.gapLeader>0) ImGui::Text("+%.1fs",c.gapLeader/std::max(20.0,c.speed/3.6));
                     else ImGui::TextDisabled("—");
+                    ImGui::TableSetColumnIndex(6);
+                    if(!c.alive) ImGui::TextDisabled("DNF");
+                    else if(c.finished) ImGui::TextColored({.27f,.88f,.76f,1},"FINISHED");
+                    else switch(timingMetric){
+                        case 0: if(rank==0)ImGui::TextDisabled("LEADER");else ImGui::Text("+%.2fs",c.gapNext/std::max(20.0,c.speed/3.6)); break;
+                        case 1: if(rank==0)ImGui::TextDisabled("LEADER");else ImGui::Text("+%.2fs",c.gapLeader/std::max(20.0,c.speed/3.6)); break;
+                        case 2: ImGui::Text("%s %dL / %.0f%%",tyreLetters[size_t(clampv(c.tyreCompound,0,3))],c.tyreLaps,c.wear*100); break;
+                        case 3: ImGui::Text("%d STOP%s",c.pitstops,c.pitstops==1?"":"S"); break;
+                        case 4: if(c.slipstream>.05)ImGui::TextColored({.29f,.64f,1,1},"%.0f%% DRAFT",c.health);else ImGui::Text("%.0f%%",c.health); break;
+                        case 5: if(c.hybrid)ImGui::Text("%.0f%%  %s",c.battery,c.regen?"RECHARGE":c.deploying?"OVERTAKE":c.drsActive?"M.O.M.":c.drsEligible?"READY":"—");else ImGui::TextColored(c.drsActive?ImVec4(.27f,.88f,.76f,1):c.drsEligible?ImVec4(1,.79f,.29f,1):ImVec4(.6f,.65f,.63f,1),"DRS"); break;
+                        case 6: ImGui::Text("%.1fkg  %s",c.fuel,c.pitRequested?"PIT":"RUN"); break;
+                        case 7: ImGui::Text("%.0fkm/h G%d %.1fk",c.speed,c.gear,c.rpm/1000.0); break;
+                        default: ImGui::Text("AGG %.0f%%  %s",c.raceAggression*100,c.aggressionError>.15?"OVERCOMMIT":c.aggressionError<-.15?"HESITATE":"PUSH"); break;
+                    }
                     ImGui::PopID();
                 }
                 ImGui::EndTable();
@@ -1471,7 +1506,7 @@ public:
             ImGui::End();
         }
         // Session controls bar
-        ImGui::SetNextWindowPos(pos(438,88));ImGui::SetNextWindowSize({display.x*1146/W,56});
+        ImGui::SetNextWindowPos(pos(583,88));ImGui::SetNextWindowSize({display.x*1001/W,56});
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,{6,4});
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,{8,4});
         ImGui::Begin("Session controls",nullptr,fixed|ImGuiWindowFlags_NoTitleBar);
@@ -1505,7 +1540,7 @@ public:
         // Focused car rich telemetry HUD
         if(!cars.empty()&&focus<int(cars.size())){
             const Car& c=cars[size_t(focus)];
-            ImGui::SetNextWindowPos(pos(438,715));ImGui::SetNextWindowSize(size(1146,148));
+            ImGui::SetNextWindowPos(pos(583,700));ImGui::SetNextWindowSize(size(1001,156));
             ImGui::Begin("Focused car telemetry",nullptr,fixed);
             if(ImGui::BeginTable("focused-dashboard",5,ImGuiTableFlags_SizingStretchSame|ImGuiTableFlags_BordersInnerV,{-1,-1})){
                 // Column 1: Driver Profile
@@ -1527,11 +1562,13 @@ public:
                 // Column 3: Throttle / Brake / Steer
                 ImGui::TableNextColumn();
                 ImGui::PushStyleColor(ImGuiCol_PlotHistogram,ImVec4(.22f,.88f,.45f,1));
-                ImGui::ProgressBar(float(c.throttle),{-1,12},"THROTTLE");
+                ImGui::ProgressBar(float(c.throttle),{-1,16},"THROTTLE");
                 ImGui::PopStyleColor();
+                ImGui::Dummy({0,3});
                 ImGui::PushStyleColor(ImGuiCol_PlotHistogram,ImVec4(1,.30f,.35f,1));
-                ImGui::ProgressBar(float(c.brake),{-1,12},"BRAKE");
+                ImGui::ProgressBar(float(c.brake),{-1,16},"BRAKE");
                 ImGui::PopStyleColor();
+                ImGui::Dummy({0,3});
                 ImGui::Text("Steer: %+.2f",c.steer);
                 // Column 4: Powertrain & Tyres
                 ImGui::TableNextColumn();
@@ -1539,11 +1576,12 @@ public:
                 if(c.hybrid){
                     ImVec4 batCol=c.deploying?ImVec4(1,.79f,.29f,1):c.regen?ImVec4(.29f,.64f,1,1):ImVec4(.27f,.88f,.76f,1);
                     ImGui::PushStyleColor(ImGuiCol_PlotHistogram,batCol);
-                    ImGui::ProgressBar(float(c.battery/100.0),{-1,12},c.deploying?"DEPLOY":c.regen?"REGEN":"BATTERY");
+                    ImGui::ProgressBar(float(c.battery/100.0),{-1,16},c.deploying?"DEPLOY":c.regen?"REGEN":"BATTERY");
                     ImGui::PopStyleColor();
                 } else {
                     ImGui::TextColored({1,.50f,.25f,1},"ICE V10 POWERTRAIN");
                 }
+                ImGui::Dummy({0,3});
                 ImGui::Text("Fuel %.1f kg  •  [%s] %.1f%%",c.fuel,tNames[size_t(clampv(c.tyreCompound,0,3))],c.wear*100.0);
                 if(c.puncture) ImGui::TextColored({1,.25f,.25f,1},"⚠ TYRE PUNCTURE!");
                 else if(c.outsideLimits) ImGui::TextColored({1,.65f,.20f,1},"⚠ OFF TRACK");
@@ -1706,7 +1744,7 @@ public:
         }
         // Replay transport controls
         if(mode==Mode::Replay&&!replay.empty()){
-            ImGui::SetNextWindowPos(pos(480,800));ImGui::SetNextWindowSize(size(740,68));
+            ImGui::SetNextWindowPos(pos(480,788));ImGui::SetNextWindowSize(size(740,62));
             ImGui::Begin("Replay transport",nullptr,fixed|ImGuiWindowFlags_NoTitleBar);
             if(ImGui::Button("◀◀ -2x"))replaySpeed=-2;ImGui::SameLine();
             if(ImGui::Button(paused?"▶ PLAY":"❚❚ PAUSE")){paused=!paused;replaySpeed=paused?0:1;}ImGui::SameLine();
@@ -1719,6 +1757,30 @@ public:
             ImGui::TextDisabled("Camera: %s",cars.empty()?"":cars[size_t(clampv(focus,0,int(cars.size())-1))].name.c_str());
             ImGui::End();
         }
+        drawKeyHints();
+    }
+    // Persistent keyboard-shortcut legend, docked along the bottom edge of every screen so controls are always visible without covering any existing panel.
+    void drawKeyHints(){
+        ImVec2 display=ImGui::GetIO().DisplaySize;auto pos=[&](float x,float y){return ImVec2(display.x*x/W,display.y*y/H);};auto size=[&](float x,float y){return ImVec2(display.x*x/W,display.y*y/H);};
+        std::string hint;
+        switch(mode){
+            case Mode::Menu: hint="1-5 Open Workspace   •   ←/→ Track   •   B/N Brain   •   G Powertrain   •   Esc Quit"; break;
+            case Mode::TrackEditor: hint="1-9 Tool   •   0 Pit/Finish Line   •   S Save   •   C Clear   •   -/+ Road Width   •   [ / ] Grass Width   •   Esc Menu"; break;
+            case Mode::Algorithm: hint="Ctrl+S Save   •   Ctrl+Z / Ctrl+Y Undo / Redo   •   Ctrl+A / C / X / V Select / Copy / Cut / Paste   •   Esc Menu"; break;
+            case Mode::RaceSetup: hint="Click a Driver to Configure   •   GRID UP/DOWN Reorder   •   Enter Start Race   •   Esc Menu"; break;
+            case Mode::HotlapSetup: hint="←/→ or ↑/↓ Choose Brain   •   Enter / Space Start Hotlap   •   Esc Menu"; break;
+            case Mode::ReplaySetup: hint="J / K / L Rewind / Pause / Fast-Forward   •   ←/→ Seek 5s   •   ↑/↓ Camera   •   Esc Menu"; break;
+            case Mode::Training: hint="Space Pause   •   R Evolve   •   S Save Best   •   -/+ Agents   •   [ / ] Zoom   •   ←/→ Tower Data   •   ↑/↓ Driver   •   Esc Menu"; break;
+            case Mode::Race: hint="Space Pause   •   R Red Flag   •   S Save Replay   •   W Toggle Rain   •   [ / ] Zoom   •   ←/→ Tower Data   •   ↑/↓ Driver   •   Esc Menu"; break;
+            case Mode::Hotlap: hint="Space Pause   •   R Restart   •   [ / ] Zoom   •   ↑/↓ Driver   •   Esc Menu"; break;
+            case Mode::Replay: hint="J / K / L Rewind / Pause / Fast-Forward   •   ←/→ Seek 5s   •   ↑/↓ Camera   •   Esc Menu"; break;
+        }
+        ImGui::SetNextWindowPos(pos(8,864));ImGui::SetNextWindowSize(size(1584,32));ImGui::SetNextWindowBgAlpha(.88f);
+        ImGui::Begin("##key-hints",nullptr,ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoNav|ImGuiWindowFlags_NoDecoration);
+        float textWidth=ImGui::CalcTextSize(hint.c_str()).x;
+        ImGui::SetCursorPosX(std::max(8.0f,(ImGui::GetWindowWidth()-textWidth)*.5f));
+        ImGui::TextDisabled("%s",hint.c_str());
+        ImGui::End();
     }
     void card(SDL_Rect q,const std::string& num,const std::string& title,const std::string& sub,SDL_Color accent){fill(ren,q,rgb(0x102b2d));outline(ren,q,accent);fill(ren,{q.x,q.y,7,q.h},accent);text(ren,q.x+28,q.y+20,num,accent,3);text(ren,q.x+90,q.y+14,title,rgb(0xf0f5f2),3);text(ren,q.x+90,q.y+52,sub,rgb(0x89a19f),2);}
     void drawMenu(){}
@@ -1872,22 +1934,49 @@ public:
     }
     Transform simulationTransform(SDL_Rect world)const{Transform t=fitTrack(track,world);V2 target{};bool found=false;if(mode!=Mode::Replay&&!cars.empty()&&focus<int(cars.size())){target=cars[size_t(focus)].position;found=true;}else if(mode==Mode::Replay&&!replay.empty()){auto it=std::lower_bound(replay.begin(),replay.end(),replayTime,[](const ReplayFrame&f,double v){return f.time<v;});const auto&frame=it==replay.end()?replay.back():*it;if(!frame.cars.empty()){int i=clampv(focus,0,int(frame.cars.size())-1);target={frame.cars[size_t(i)].x,frame.cars[size_t(i)].y};found=true;}}if(found){t.scale=cameraZoom;t.ox=world.x+world.w*.5-target.x*t.scale;t.oy=world.y+world.h*.5-target.y*t.scale;}return t;}
     void drawSimulation(){
-        SDL_Rect world{360,90,1215,770};
+        SDL_Rect world{465,90,1110,770};
         SDL_RenderSetClipRect(ren,&world);
         drawGrassBackground(world);
         Transform t=simulationTransform(world);
         drawTrack(world,false,&t);
+        if(mode==Mode::Race)drawGridBoxes(t,int(cars.size()));
         if(mode==Mode::Replay)drawReplayCars(t);
         else for(size_t i=0;i<cars.size();++i)if(!cars[i].removed)drawCarScreen(t.screen(cars[i].position),cars[i].angle,cars[i].col,cars[i].hybrid,int(i)==focus,t.scale);
         SDL_RenderSetClipRect(ren,nullptr);
-        fill(ren,{18,92,342,773},rgb(0x102628));
+        // Backdrop only needs to cover the timing tower's footprint now that the minimap lives in the top-right corner of the track view (see drawMiniMap); it used to run all the way down and collide with the minimap and the telemetry panel below it.
+        fill(ren,{18,92,542,614},rgb(0x102628));
         if(mode==Mode::Replay){text(ren,35,108,"REPLAY",rgb(0xf2f6f4),2);}
         drawMiniMap();
         if(mode==Mode::Race&&countdown>0)drawLights();
         if(paused)text(ren,870,420,"PAUSED",rgb(0xffc94a),4);
     }
     void drawTower(){if(mode==Mode::Replay)return;std::vector<int> order(cars.size());for(size_t i=0;i<cars.size();++i)order[i]=int(i);std::sort(order.begin(),order.end(),[&](int a,int b){return cars[a].lap==cars[b].lap?cars[a].s>cars[b].s:cars[a].lap>cars[b].lap;});for(size_t row=0;row<order.size()&&row<20;++row){int i=order[row],y=172+int(row)*31;if(i==focus)fill(ren,{26,y-5,306,27},rgb(0x214449));fill(ren,{35,y,8,14},cars[i].col);text(ren,52,y,std::to_string(row+1),rgb(0xdce8e4),2);text(ren,78,y,cars[i].name,rgb(0xdce8e4),2,8);std::ostringstream s;s<<int(cars[i].speed)<<" G"<<cars[i].gear;text(ren,190,y,s.str(),rgb(0x90aaa5),2);if(cars[i].hybrid)text(ren,268,y,std::to_string(int(cars[i].battery)),cars[i].regen?rgb(0x4aa3ff):cars[i].deploying?rgb(0xffc94a):rgb(0x90aaa5),2);}}
-    void drawMiniMap(){SDL_Rect q{35,700,305,155};fill(ren,q,rgb(0x081619));SDL_RenderSetClipRect(ren,&q);Transform t=fitTrack(track,q,15);drawTrack(q,false,&t);if(mode!=Mode::Replay){for(size_t i=0;i<cars.size();++i){if(cars[i].removed)continue;auto p=t.screen(cars[i].position);int radius=int(i)==focus?4:2;fill(ren,{int(p.x)-radius,int(p.y)-radius,radius*2+1,radius*2+1},cars[i].col);if(int(i)==focus)outline(ren,{int(p.x)-radius-2,int(p.y)-radius-2,radius*2+5,radius*2+5},rgb(0xffffff));}}else if(!replay.empty()){auto it=std::lower_bound(replay.begin(),replay.end(),replayTime,[](const ReplayFrame&f,double v){return f.time<v;});const auto&f=it==replay.end()?replay.back():*it;for(size_t i=0;i<f.cars.size();++i){auto p=t.screen({f.cars[i].x,f.cars[i].y});int radius=int(i)==focus?4:2;fill(ren,{int(p.x)-radius,int(p.y)-radius,radius*2+1,radius*2+1},palette[i%palette.size()]);}}SDL_RenderSetClipRect(ren,nullptr);}
+    // Paints one starting box per grid slot using the exact same row/column formula startRace() uses to place the cars, so the boxes always match however many cars (and whichever grid geometry) the race was actually configured with.
+    void drawGridBoxes(const Transform&t,int carCount){
+        if(carCount<=0||track.points.empty())return;
+        const double coordinateMetres=track.geometryLength/std::max(1.0,track.lengthM);
+        for(int i=0;i<carCount;++i){
+            const int row=i/2,column=i%2;
+            const double targetDistance=row*(CAR_LENGTH_M+8.0)+column*4.0;
+            const double s=std::fmod(track.lengthM-targetDistance+track.lengthM,track.lengthM);
+            const double halfWidth=clampv(track.widthAt(0)*.20,CAR_WIDTH_M*.5+.55,std::max(CAR_WIDTH_M*.5+.55,track.widthAt(0)*.5-CAR_WIDTH_M*.5-.75));
+            const double lateral=column?-halfWidth:halfWidth;
+            auto[base,tangent]=track.at(s);
+            V2 forward=tangent,side=normal(tangent);
+            V2 center=base+side*(lateral*coordinateMetres);
+            const double boxLen=(CAR_LENGTH_M+1.6)*coordinateMetres*.5,boxWid=(CAR_WIDTH_M+1.2)*coordinateMetres*.5;
+            V2 frontLeft=center+forward*boxLen+side*boxWid,backLeft=center-forward*boxLen+side*boxWid;
+            V2 backRight=center-forward*boxLen-side*boxWid,frontRight=center+forward*boxLen-side*boxWid;
+            SDL_FPoint pts[4]={t.screen(backLeft),t.screen(frontLeft),t.screen(frontRight),t.screen(backRight)};
+            SDL_SetRenderDrawColor(ren,255,255,255,185);
+            SDL_RenderDrawLinesF(ren,pts,4);
+            SDL_FPoint labelAt=t.screen(center-forward*(boxLen*.35));
+            text(ren,int(labelAt.x)-4,int(labelAt.y)-6,std::to_string(i+1),rgb(0xffffff),1);
+        }
+    }
+    void drawMiniMap(){
+        // Top-right corner of the track view: clear of the timing tower, session-control bar and telemetry panel at every window size, unlike the old bottom-left slot which crowded/overlapped those ImGui windows.
+        SDL_Rect q{1385,150,195,175};fill(ren,q,rgb(0x081619));SDL_RenderSetClipRect(ren,&q);Transform t=fitTrack(track,q,15);drawTrack(q,false,&t);if(mode!=Mode::Replay){for(size_t i=0;i<cars.size();++i){if(cars[i].removed)continue;auto p=t.screen(cars[i].position);int radius=int(i)==focus?4:2;fill(ren,{int(p.x)-radius,int(p.y)-radius,radius*2+1,radius*2+1},cars[i].col);if(int(i)==focus)outline(ren,{int(p.x)-radius-2,int(p.y)-radius-2,radius*2+5,radius*2+5},rgb(0xffffff));}}else if(!replay.empty()){auto it=std::lower_bound(replay.begin(),replay.end(),replayTime,[](const ReplayFrame&f,double v){return f.time<v;});const auto&f=it==replay.end()?replay.back():*it;for(size_t i=0;i<f.cars.size();++i){auto p=t.screen({f.cars[i].x,f.cars[i].y});int radius=int(i)==focus?4:2;fill(ren,{int(p.x)-radius,int(p.y)-radius,radius*2+1,radius*2+1},palette[i%palette.size()]);}}SDL_RenderSetClipRect(ren,nullptr);}
     void drawLights(){
         int lit=clampv(5-int(std::ceil(countdown)),0,5);
         bool active=countdown>0;
@@ -1928,4 +2017,8 @@ bool simulationSmoke(){
 }
 } // namespace
 
-int main(int argc,char**argv){std::string arg=argc>1?argv[1]:"";if(arg=="--smoke-test")return smoke()?0:1;if(arg=="--simulation-test")return simulationSmoke()?0:1;App app;if(!app.init())return 1;if(arg.find("small")!=std::string::npos||arg.find("screenshot")!=std::string::npos)app.resizeForTest(1100,680);if(arg=="--ui-screenshot-editor"||arg=="--ui-track-studio")app.openWorkspace(0);if(arg=="--ui-training-setup")app.openWorkspace(1);if(arg=="--ui-screenshot-race"||arg=="--ui-race-setup")app.openWorkspace(2);if(arg=="--ui-hotlap-setup")app.openWorkspace(3);app.run(arg.rfind("--ui-",0)==0?3:-1);if(arg.find("screenshot")!=std::string::npos&&!app.saveScreenshot("/tmp/formula_ai_cpp_ui.bmp"))return 2;return 0;}
+int main(int argc,char**argv){std::string arg=argc>1?argv[1]:"";if(arg=="--smoke-test")return smoke()?0:1;if(arg=="--simulation-test")return simulationSmoke()?0:1;App app;if(!app.init())return 1;if((arg.find("small")!=std::string::npos||arg.find("screenshot")!=std::string::npos)&&arg.find("live")==std::string::npos)app.resizeForTest(1100,680);else if(arg.find("live")!=std::string::npos)app.resizeForTest(1600,900);if(arg=="--ui-screenshot-editor"||arg=="--ui-track-studio")app.openWorkspace(0);if(arg=="--ui-training-setup")app.openWorkspace(1);if(arg=="--ui-screenshot-race"||arg=="--ui-race-setup")app.openWorkspace(2);if(arg=="--ui-hotlap-setup")app.openWorkspace(3);
+    int frameLimit=arg.rfind("--ui-",0)==0?3:-1;
+    if(arg=="--ui-live-race"){app.startRace();frameLimit=180;}
+    if(arg=="--ui-live-training"){app.startTraining();frameLimit=180;}
+    app.run(frameLimit);if((arg.find("screenshot")!=std::string::npos||arg.find("live")!=std::string::npos)&&!app.saveScreenshot("/tmp/formula_ai_cpp_ui.bmp"))return 2;return 0;}
